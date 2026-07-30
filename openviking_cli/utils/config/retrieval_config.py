@@ -35,5 +35,31 @@ class RetrievalConfig(BaseModel):
             "(same path as no-session search)."
         ),
     )
+    lexical_fusion_weight: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight of lexical (grep) rank blended into find scores. "
+            "0 disables lexical fusion."
+        ),
+    )
+    filename_boost_weight: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Boost weight for results whose filename contains a query identifier. "
+            "0 disables the boost."
+        ),
+    )
+    graph_expansion_hops: int = Field(
+        default=0,
+        ge=0,
+        le=1,
+        description=(
+            "Expand find results by imports of top seeds (0 disables, 1 enables one hop)."
+        ),
+    )
 
     model_config = {"extra": "forbid"}

@@ -22,7 +22,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
@@ -142,6 +142,67 @@ def _prepare_snapshot_diff(
 def _ensure_non_empty_search_query(query: str, image_url: Optional[str] = None) -> None:
     if not query.strip() and not image_url:
         raise InvalidArgumentError("Search query or image_url must not be empty.")
+
+
+async def apply_lexical_fusion(
+    dense_matches: List[Any],
+    terms: List[str],
+    grep_uris: Callable[[str], Awaitable[List[str]]],
+    read_abstract: Callable[[str], Awaitable[str]],
+    lexical_weight: float,
+    filename_weight: float,
+    limit: int,
+    max_lexical_only: int = 5,
+) -> List[Any]:
+    """Blend dense find results with lexical grep candidates.
+
+    ``grep_uris`` returns candidate URIs ranked by lexical relevance for a
+    given pattern; ``read_abstract`` fetches an abstract for lexical-only
+    candidates that were not part of the dense result set. See
+    ``openviking.retrieve.lexical_fusion`` for the scoring math. Any grep
+    failure falls back to the dense-only results.
+    """
+    from openviking.retrieve.lexical_fusion import filename_matches, fuse_scores
+    from openviking_cli.retrieve.types import ContextType, MatchedContext
+
+    if not terms or (lexical_weight <= 0 and filename_weight <= 0):
+        return dense_matches[:limit]
+
+    pattern = "|".join(re.escape(t) for t in terms)
+    try:
+        lexical_uris = await grep_uris(pattern)
+    except Exception:
+        logger.warning("[find] lexical recall failed, dense-only results", exc_info=True)
+        return dense_matches[:limit]
+
+    dense_by_uri = {m.uri: m for m in dense_matches}
+    all_uris = set(dense_by_uri) | set(lexical_uris[: limit + max_lexical_only])
+    filename_hits = {u for u in all_uris if filename_matches(u, terms)} if filename_weight > 0 else set()
+    fused = fuse_scores(
+        dense_scores={u: m.score for u, m in dense_by_uri.items()},
+        lexical_ranking=lexical_uris,
+        filename_hits=filename_hits,
+        lexical_weight=lexical_weight,
+        filename_weight=filename_weight,
+    )
+
+    results: List[Any] = []
+    lexical_only_added = 0
+    for uri, signals in sorted(fused.items(), key=lambda kv: kv[1]["fused"], reverse=True):
+        match = dense_by_uri.get(uri)
+        if match is None:
+            if lexical_only_added >= max_lexical_only:
+                continue
+            lexical_only_added += 1
+            try:
+                abstract = await read_abstract(uri)
+            except Exception:
+                abstract = ""
+            match = MatchedContext(uri=uri, context_type=ContextType.RESOURCE, abstract=abstract)
+        match.score = signals["fused"]
+        match.signals = {**match.signals, **signals}
+        results.append(match)
+    return results[:limit]
 
 
 def _is_directory_not_empty_error(message: str) -> bool:
@@ -2165,18 +2226,46 @@ class VikingFS:
             f"ctx.account_id={real_ctx.account_id}, ctx.user={real_ctx.user}"
         )
 
+        from openviking_cli.utils.config import RetrievalConfig
+
+        retrieval_cfg = self.retrieval_config or RetrievalConfig()
+        fusion_enabled = (
+            not image_url
+            and bool(retrieval_targets.target_directories)
+            and (retrieval_cfg.lexical_fusion_weight > 0 or retrieval_cfg.filename_boost_weight > 0)
+        )
+        retrieve_limit = max(limit * 3, 20) if fusion_enabled else limit
+
         result = await retriever.retrieve(
             typed_query,
             ctx=real_ctx,
-            limit=limit,
+            limit=retrieve_limit,
             score_threshold=score_threshold,
             scope_dsl=filter,
             level=level,
         )
 
+        matched_contexts = result.matched_contexts
+        if fusion_enabled:
+            matched_contexts = await self._apply_find_lexical_fusion(
+                matched_contexts,
+                query=query,
+                grep_target=retrieval_targets.target_directories[0],
+                retrieval_cfg=retrieval_cfg,
+                limit=limit,
+                ctx=ctx,
+            )
+        else:
+            matched_contexts = matched_contexts[:limit]
+
+        if retrieval_cfg.graph_expansion_hops >= 1 and not image_url:
+            matched_contexts = await self._apply_find_graph_expansion(
+                matched_contexts, limit=limit, ctx=ctx
+            )
+
         # Convert QueryResult to FindResult
         memories, resources, skills = [], [], []
-        for ctx in result.matched_contexts:
+        for ctx in matched_contexts:
             if ctx.context_type == ContextType.MEMORY:
                 memories.append(ctx)
             elif ctx.context_type == ContextType.RESOURCE:
@@ -2191,6 +2280,117 @@ class VikingFS:
         )
         telemetry.set("vector.returned", find_result.total)
         return find_result
+
+    async def _apply_find_lexical_fusion(
+        self,
+        matched_contexts: List[Any],
+        query: str,
+        grep_target: str,
+        retrieval_cfg: "RetrievalConfig",
+        limit: int,
+        ctx: Optional[RequestContext],
+    ) -> List[Any]:
+        """Blend dense find() results with lexical (grep) recall. See apply_lexical_fusion."""
+        from openviking.retrieve.lexical_fusion import extract_identifiers
+
+        terms = extract_identifiers(query)
+        if not terms:
+            return matched_contexts[:limit]
+
+        async def _grep_uris(pattern: str) -> List[str]:
+            grep_result = await self.grep(
+                uri=grep_target,
+                pattern=pattern,
+                case_insensitive=True,
+                node_limit=200,
+                ctx=ctx,
+            )
+            ranked: Dict[str, int] = {}
+            for m in grep_result.get("matches", []):
+                uri = m.get("uri") or ""
+                if uri:
+                    ranked[uri] = ranked.get(uri, 0) + 1
+            return [u for u, _ in sorted(ranked.items(), key=lambda kv: kv[1], reverse=True)]
+
+        async def _read_abstract(uri: str) -> str:
+            return await self.abstract(uri, ctx=ctx)
+
+        return await apply_lexical_fusion(
+            matched_contexts,
+            terms,
+            _grep_uris,
+            _read_abstract,
+            retrieval_cfg.lexical_fusion_weight,
+            retrieval_cfg.filename_boost_weight,
+            limit,
+        )
+
+    async def _apply_find_graph_expansion(
+        self,
+        matched_contexts: List[Any],
+        limit: int,
+        ctx: Optional[RequestContext],
+        seed_count: int = 3,
+        max_added: int = 5,
+    ) -> List[Any]:
+        """Expand top-ranked L2 seeds by their relative imports, one hop.
+
+        Never raises: any failure leaves ``matched_contexts`` untouched.
+        """
+        from openviking_cli.retrieve.types import ContextType, MatchedContext
+
+        try:
+            from openviking.retrieve.graph_expansion import (
+                SCORE_DECAY,
+                extract_imports,
+                resolve_import_candidates,
+            )
+
+            existing_uris = {m.uri for m in matched_contexts}
+            seeds = [m for m in matched_contexts if getattr(m, "level", 2) == 2][:seed_count]
+
+            added: List[Any] = []
+            for seed in seeds:
+                if len(added) >= max_added:
+                    break
+                try:
+                    content = await self.read_file(seed.uri, ctx=ctx)
+                except Exception:
+                    continue
+                file_name = seed.uri.rsplit("/", 1)[-1]
+                for spec in extract_imports(file_name, content):
+                    if len(added) >= max_added:
+                        break
+                    for candidate_uri in resolve_import_candidates(seed.uri, spec):
+                        if candidate_uri in existing_uris:
+                            continue
+                        if not await self.exists(candidate_uri, ctx=ctx):
+                            continue
+                        try:
+                            abstract = await self.abstract(candidate_uri, ctx=ctx)
+                        except Exception:
+                            abstract = ""
+                        graph_score = seed.score * SCORE_DECAY
+                        added.append(
+                            MatchedContext(
+                                uri=candidate_uri,
+                                context_type=ContextType.RESOURCE,
+                                abstract=abstract,
+                                score=graph_score,
+                                signals={"graph": 1.0, "final": graph_score},
+                            )
+                        )
+                        existing_uris.add(candidate_uri)
+                        break
+
+            if not added:
+                return matched_contexts
+
+            combined = sorted(matched_contexts + added, key=lambda m: m.score, reverse=True)
+            return combined[:limit]
+        except Exception:
+            logger.warning("[find] graph expansion failed, returning unexpanded results", exc_info=True)
+            return matched_contexts
 
     async def search(
         self,
