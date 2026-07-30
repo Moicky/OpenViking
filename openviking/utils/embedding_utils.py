@@ -26,6 +26,7 @@ from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.image_search import image_bytes_to_data_uri
 from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.summary_quality import is_failed_summary
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.utils import VikingURI, get_logger
 from openviking_cli.utils.config import get_openviking_config
@@ -440,6 +441,13 @@ async def vectorize_directory_meta(
         await _decrement_embedding_tracker(semantic_msg_id, expected - enqueued)
 
 
+def build_embedding_text(uri: str, body: str) -> str:
+    """Prefix embedding input with the repo-relative path so filename and
+    directory tokens contribute to the dense representation."""
+    path = uri.split("://", 1)[-1].lstrip("/")
+    return f"{path}\n{body}" if body else path
+
+
 async def vectorize_file(
     file_path: str,
     summary_dict: Dict[str, Any],
@@ -540,12 +548,23 @@ async def vectorize_file(
                     logger.warning(f"No summary available for {file_path}, skipping vectorization")
                     return
             else:
-                if summary and effective_text_source in {"summary_first", "summary_only"}:
+                if (
+                    summary
+                    and not is_failed_summary(summary)
+                    and effective_text_source in {"summary_first", "summary_only"}
+                ):
                     # Use summary for vectorization, but reuse the single raw text read for BM25.
-                    context.set_vectorize(Vectorize(text=summary, full_text=content or summary))
+                    context.set_vectorize(
+                        Vectorize(
+                            text=build_embedding_text(file_path, summary),
+                            full_text=content or summary,
+                        )
+                    )
                 else:
                     # Embedders apply their own input guard.
-                    context.set_vectorize(Vectorize(text=content, full_text=content))
+                    context.set_vectorize(
+                        Vectorize(text=build_embedding_text(file_path, content), full_text=content)
+                    )
         elif content_type == ResourceContentType.IMAGE:
             # Multimodal embedders consume both parts; text-only embedders fall back to summary.
             image_uri = await _build_image_data_uri(file_path, file_name, viking_fs, ctx)

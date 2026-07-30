@@ -5,7 +5,7 @@
 import asyncio
 import threading
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 from weakref import WeakKeyDictionary
 
 from openviking.server.identity import RequestContext
@@ -23,6 +23,21 @@ logger = get_logger(__name__)
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
 _SKIP_FILENAMES = frozenset({"messages.jsonl"})
+
+
+def resolve_vectorize_summary(
+    summary_dict: Dict[str, str], is_code_repo: bool
+) -> Tuple[Dict[str, str], bool]:
+    """Scrub failed summaries and decide whether to force summary embedding.
+
+    The configured ``embedding.text_source`` governs the embedding source;
+    code repositories no longer force ``summary_only``.
+    """
+    from openviking.utils.summary_quality import is_failed_summary
+
+    if is_failed_summary(summary_dict.get("summary")):
+        summary_dict = {**summary_dict, "summary": ""}
+    return summary_dict, False
 
 
 @dataclass
@@ -709,7 +724,9 @@ class SemanticDagExecutor:
             return
         try:
             if need_vectorize:
-                use_summary = self._is_code_repo and bool(summary_dict.get("summary"))
+                summary_dict, use_summary = resolve_vectorize_summary(
+                    summary_dict, is_code_repo=self._is_code_repo
+                )
                 task = VectorizeTask(
                     task_type="file",
                     uri=file_path,
