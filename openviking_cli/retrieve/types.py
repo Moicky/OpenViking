@@ -291,6 +291,7 @@ class MatchedContext:
     category: str = ""
     score: float = 0.0
     match_reason: str = ""
+    signals: Dict[str, float] = field(default_factory=dict)
 
     relations: List[RelatedContext] = field(default_factory=list)
 

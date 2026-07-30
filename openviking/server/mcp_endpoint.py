@@ -324,7 +324,7 @@ def _format_search_result(result) -> str:
             getattr(m, "abstract", "") or getattr(m, "overview", "") or "(no abstract)"
         ).strip()
         score = getattr(m, "score", 0.0)
-        lines.append(f"- [{ctx_type} {score * 100:.0f}%] {m.uri}\n    {abstract}")
+        lines.append(f"- [{ctx_type} {score * 100:.1f}%] {m.uri}\n    {abstract}")
 
     return (
         f"Found {len(items)} item(s):\n\n"

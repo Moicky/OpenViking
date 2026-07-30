@@ -604,6 +604,10 @@ class HierarchicalRetriever:
             level = c.get("level", 2)
             display_uri = self._append_level_suffix(c.get("uri", ""), level)
 
+            signals = {"retrieval": semantic_score, "final": final_score}
+            if apply_hotness and alpha > 0:
+                signals["hotness"] = h_score
+
             results.append(
                 MatchedContext(
                     uri=display_uri,
@@ -615,6 +619,7 @@ class HierarchicalRetriever:
                     category=c.get("category", ""),
                     score=final_score,
                     relations=relations,
+                    signals=signals,
                 )
             )
 
