@@ -17,6 +17,7 @@ from openviking.session.memory.utils.language import (
     _language_from_timezone_value,
     _resolve_system_fallback_language,
     resolve_output_language,
+    resolve_output_language_for_code,
     resolve_output_language_from_conversation,
 )
 
@@ -622,3 +623,69 @@ class TestOutputLanguageOverride:
         conversation = "[0][user][alice]: 请使用中文\n[1][assistant][bot]: 한국어 응답"
         result = resolve_output_language_from_conversation(conversation, config=config)
         assert result == "zh-CN"
+
+
+# Plain TypeScript import syntax whose tokens ("el", "la", "de", "una") happen
+# to be Spanish stopwords. Long enough to satisfy the Latin sub-detector's
+# strong-dominance threshold, reproducing the false-positive on real code.
+_LATIN_AMBIGUOUS_CODE = "\n".join(
+    [
+        "import el from './el';",
+        "import la from './la';",
+        "import de from './de';",
+        "import una from './una';",
+    ]
+    * 5
+)
+
+
+class TestCodeContentLanguageDetection:
+    """Code content must not be mis-detected as a non-English Latin language."""
+
+    def test_baseline_stopword_heuristic_misdetects_code_as_spanish(self):
+        # Documents the actual bug: default detection (as used for prose)
+        # picks up incidental stopword overlaps in plain code syntax.
+        assert _detect_language_from_text(_LATIN_AMBIGUOUS_CODE, "en") == "es"
+
+    def test_code_aware_detection_forces_english_for_latin_ambiguous_content(self):
+        result = _detect_language_from_text(
+            _LATIN_AMBIGUOUS_CODE, "en", enable_latin_subdetection=False
+        )
+        assert result == "en"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("这是一个中文文档，用于测试语言检测功能" * 2, "zh-CN"),
+            ("これは日本語のテキストです。今日は会議です。" * 2, "ja"),
+            ("Это русский документ для проверки памяти пользователя и настроек проекта" * 2, "ru"),
+            ("هذا مستند اختبار باللغة العربية للتحقق من نظام الترجمة" * 2, "ar"),
+        ],
+    )
+    def test_code_aware_detection_still_detects_non_latin_scripts(self, text, expected):
+        # Non-Latin script detection (the real, reliable signal) must be
+        # unaffected -- only the fragile Latin stopword sub-classifier is skipped.
+        result = _detect_language_from_text(text, "en", enable_latin_subdetection=False)
+        assert result == expected
+
+    def test_resolve_output_language_for_code_uses_english_for_latin_ambiguous_content(self):
+        config = MagicMock(output_language_override="")
+        result = resolve_output_language_for_code(_LATIN_AMBIGUOUS_CODE, config=config)
+        assert result == "en"
+
+    def test_resolve_output_language_for_code_still_detects_chinese(self):
+        config = MagicMock(output_language_override="")
+        result = resolve_output_language_for_code("这是一个中文文档，用于测试语言检测功能" * 2, config=config)
+        assert result == "zh-CN"
+
+    def test_resolve_output_language_for_code_respects_override(self):
+        config = MagicMock(output_language_override="fr")
+        result = resolve_output_language_for_code(_LATIN_AMBIGUOUS_CODE, config=config)
+        assert result == "fr"
+
+    def test_resolve_output_language_unchanged_for_prose(self):
+        # Sanity guard: the original prose-oriented function must still run
+        # full Latin sub-detection (used for documentation/README files).
+        config = MagicMock(output_language_override="")
+        result = resolve_output_language(_LATIN_AMBIGUOUS_CODE, config=config)
+        assert result == "es"

@@ -1086,12 +1086,19 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.warning("VLM not available, using empty summary")
             return result("")
 
-        from openviking.session.memory.utils.language import resolve_output_language
-
-        output_language = resolve_output_language(content)
+        from openviking.session.memory.utils.language import (
+            resolve_output_language,
+            resolve_output_language_for_code,
+        )
 
         # Detect file type and select appropriate prompt
         file_type = self._detect_file_type(file_name)
+
+        output_language = (
+            resolve_output_language_for_code(content)
+            if file_type == FILE_TYPE_CODE
+            else resolve_output_language(content)
+        )
 
         if file_type == FILE_TYPE_CODE:
             code_mode = get_openviking_config().code.code_summary_mode

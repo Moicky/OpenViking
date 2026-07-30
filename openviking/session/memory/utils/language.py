@@ -292,8 +292,21 @@ def _detect_latin_language(text: str, fallback_language: str) -> str:
     return "en"
 
 
-def _detect_language_from_text(user_text: str, fallback_language: str) -> str:
-    """Internal shared helper to detect dominant language from text."""
+def _detect_language_from_text(
+    user_text: str,
+    fallback_language: str,
+    *,
+    enable_latin_subdetection: bool = True,
+) -> str:
+    """Internal shared helper to detect dominant language from text.
+
+    ``enable_latin_subdetection=False`` skips the stopword-based Latin-script
+    sub-classifier (Spanish/Italian/French/German/Portuguese vs. English),
+    since it is unreliable on non-prose text such as source code, where
+    identifiers and import paths can spuriously match another language's
+    stopwords. Non-Latin script detection (CJK, Japanese kana, Korean,
+    Cyrillic, Arabic) is unaffected either way.
+    """
     fallback = (fallback_language or "en").strip() or "en"
     user_text = strip_language_detection_noise(user_text)
 
@@ -337,6 +350,8 @@ def _detect_language_from_text(user_text: str, fallback_language: str) -> str:
         return language
 
     if counts["latin"] > 0:
+        if not enable_latin_subdetection:
+            return "en"
         return _detect_latin_language(user_text, fallback)
     return fallback
 
@@ -381,6 +396,23 @@ def resolve_output_language(text: str, config=None) -> str:
     """Resolve output language from text, honoring config override before detection."""
     fallback = _resolve_system_fallback_language("en")
     return resolve_output_language_from_text(text, config=config, fallback_language=fallback)
+
+
+def resolve_output_language_for_code(text: str, config=None) -> str:
+    """Resolve output language for source code content.
+
+    Like ``resolve_output_language`` (respects config override, locale/timezone
+    fallback, and non-Latin script detection), but treats Latin-script content
+    as English instead of running the stopword-based Latin-language
+    sub-classifier, since code identifiers and import paths can spuriously
+    match another language's stopwords even when the file is plain English.
+    """
+    fallback = _resolve_system_fallback_language("en")
+    fallback = (fallback or "en").strip() or "en"
+    return resolve_with_override(
+        config,
+        lambda: _detect_language_from_text(text, fallback, enable_latin_subdetection=False),
+    )
 
 
 def resolve_output_language_from_conversation(conversation: str, config=None) -> str:
