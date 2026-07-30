@@ -1345,7 +1345,7 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.warning("VLM not available, using default overview")
             return f"# {dir_uri.split('/')[-1]}\n\n[Directory overview is not ready]"
 
-        from openviking.session.memory.utils.language import resolve_output_language
+        from openviking.session.memory.utils.language import resolve_output_language_for_code
 
         # Build file index mapping and summary string
         file_index_map = {}
@@ -1369,7 +1369,9 @@ class SemanticProcessor(DequeueHandlerBase):
             language_source_parts.append(children_abstracts_str)
         if not language_source_parts:
             language_source_parts.append(dir_uri.split("/")[-1])
-        output_language = resolve_output_language("\n".join(language_source_parts), config=config)
+        output_language = resolve_output_language_for_code(
+            "\n".join(language_source_parts), config=config
+        )
 
         # Budget guard: check if prompt would be oversized
         estimated_size = len(file_summaries_str) + len(children_abstracts_str)

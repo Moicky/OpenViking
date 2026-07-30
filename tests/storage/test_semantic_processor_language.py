@@ -689,3 +689,14 @@ class TestCodeContentLanguageDetection:
         config = MagicMock(output_language_override="")
         result = resolve_output_language(_LATIN_AMBIGUOUS_CODE, config=config)
         assert result == "es"
+
+    def test_directory_overview_language_source_also_needs_code_aware_detection(self):
+        # Directory overviews are synthesized from child filenames + file
+        # summaries -- code-derived text, not independent human prose -- so
+        # they are just as prone to spurious Latin-language stopword hits.
+        language_source = "\n".join(
+            [f"[{i}] el.ts: Handles the la module for de processing" for i in range(1, 8)]
+        )
+        config = MagicMock(output_language_override="")
+        assert resolve_output_language(language_source, config=config) != "en"
+        assert resolve_output_language_for_code(language_source, config=config) == "en"
