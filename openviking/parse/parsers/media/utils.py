@@ -31,6 +31,27 @@ def _is_svg(data: bytes) -> bool:
     return data[:4] == b"<svg" or (data[:5] == b"<?xml" and b"<svg" in data[:100])
 
 
+def _vlm_image_format(data: bytes) -> Optional[str]:
+    """Return the MIME type if a VLM API will accept these bytes, else None.
+
+    Every provider we target accepts exactly PNG/JPEG/GIF/WebP, so this is the
+    common denominator. Detection is by magic bytes rather than extension --
+    ``IMAGE_EXTENSIONS`` also covers .ico/.bmp/.tiff/.icns/.dib/.sgi/.jp2/.svg,
+    and a mislabelled file would fail the same way.
+    """
+    if _is_svg(data) or len(data) < 8:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _convert_svg_to_png(svg_data: bytes) -> Optional[bytes]:
     """Convert SVG to PNG using cairosvg or wand.
 
@@ -151,13 +172,20 @@ async def generate_image_summary(
         if not isinstance(image_bytes, bytes):
             raise ValueError(f"Expected bytes for image file, got {type(image_bytes)}")
 
-        # Check for unsupported formats (SVG, etc.) by detecting magic bytes
-        # SVG format is not supported by VolcEngine VLM API, skip VLM analysis
-        if _is_svg(image_bytes):
+        # IMAGE_EXTENSIONS is wider than any VLM API accepts (.ico, .bmp, .tiff,
+        # .icns, .dib, .sgi, .jp2, .svg). Sending one costs a round-trip and comes
+        # back as a 400, so decide from the magic bytes instead of the extension.
+        detected = _vlm_image_format(image_bytes)
+        if detected is None:
             logger.info(
-                f"[MediaUtils.generate_image_summary] SVG format detected, skipping VLM analysis: {image_uri}"
+                f"[MediaUtils.generate_image_summary] Format not accepted by the VLM API "
+                f"(magic bytes {image_bytes[:8].hex()}), skipping VLM analysis: {image_uri}"
             )
-            return {"name": file_name, "summary": "SVG image (format not supported by VLM)"}
+            return {
+                "name": file_name,
+                "summary": f"{Path(file_name).suffix.lstrip('.').upper() or 'Binary'} "
+                "image (format not supported by VLM)",
+            }
 
         logger.info(
             f"[MediaUtils.generate_image_summary] Generating summary for image: {image_uri}"

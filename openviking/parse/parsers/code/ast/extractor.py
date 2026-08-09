@@ -16,8 +16,12 @@ logger = get_logger(__name__)
 _EXT_MAP: Dict[str, str] = {
     ".py": "python",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".jsx": "javascript",
     ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".tsx": "typescript",
     ".java": "java",
     ".c": "cpp",
