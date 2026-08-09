@@ -497,7 +497,16 @@ impl LocalFileSystem {
                 use std::io::Read;
                 let _ = err.read_to_string(&mut stderr);
             }
-            return Err(Error::InvalidOperation(format!("rg failed: {}", stderr)));
+            // `--no-messages` above silences per-file open/read errors but leaves
+            // pattern errors on stderr, and rg still exits 2 either way. So an empty
+            // stderr means the only failures were the file-level ones we explicitly
+            // asked rg to ignore -- an unreadable directory, or a file removed
+            // mid-walk while the index is being written. Everything else was
+            // searched and is already in `out`; failing the whole grep because one
+            // file was unreadable loses those matches for no reason.
+            if !stderr.trim().is_empty() {
+                return Err(Error::InvalidOperation(format!("rg failed: {}", stderr)));
+            }
         }
 
         Ok(Some(out))
@@ -1818,6 +1827,47 @@ mod tests {
         std::fs::set_permissions(&blocked_dir, restore).unwrap();
 
         assert!(out.is_err());
+    }
+
+    #[test]
+    fn grep_via_rg_keeps_matches_when_a_path_is_unreadable() {
+        // rg exits 2 for an unreadable path, but `--no-messages` leaves stderr
+        // empty, so the exit code alone cannot tell that apart from a real
+        // failure. The files rg *could* read were still searched and must survive.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("ok.txt"), "needle\n").unwrap();
+        let blocked = root.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("hidden.txt"), "needle\n").unwrap();
+
+        let mut perms = std::fs::metadata(&blocked).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(&blocked, perms).unwrap();
+
+        let unblock = || {
+            let mut perms = std::fs::metadata(&blocked).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&blocked, perms).unwrap();
+        };
+
+        if std::fs::read_dir(&blocked).is_ok() {
+            // Running as root, where the mode bits do not bite. Nothing to prove.
+            unblock();
+            return;
+        }
+
+        let result =
+            LocalFileSystem::grep_via_rg(root, root, "needle", true, false, None, None, None);
+        unblock();
+
+        let out = result.expect("an unreadable path must not fail the whole grep");
+        let Some(out) = out else {
+            return; // rg not installed on this machine; the libs fallback covers it
+        };
+        assert_eq!(out.count, 1, "the readable match must still be returned");
     }
 }
 
