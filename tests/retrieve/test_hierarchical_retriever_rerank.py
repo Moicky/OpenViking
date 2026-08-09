@@ -637,3 +637,69 @@ async def test_convert_to_matched_contexts_returns_empty_relations():
     )
 
     assert result[0].relations == []
+
+
+class OrphanSubtreeStorage(DummyStorage):
+    """Subtree whose intermediate directories have no indexed records.
+
+    Mirrors the real memory tree: files live at
+    ``<target>/<peer>/<topic>.md`` but neither ``<target>`` nor
+    ``<target>/<peer>`` has an L0/L1 record. Recursive descent walks exact
+    parent_uri links, so it dead-ends immediately; only a flat subtree
+    search can reach the files.
+    """
+
+    LEAF = "viking://user/u/memories/preferences/user/pref.md"
+
+    async def search_in_tenant(
+        self,
+        ctx,
+        query_vector=None,
+        sparse_query_vector=None,
+        context_type=None,
+        target_directories=None,
+        extra_filter=None,
+        level=None,
+        limit: int = 10,
+        offset: int = 0,
+    ):
+        self.search_calls.append({"level": level, "target_directories": target_directories})
+        # No L0/L1 directory records exist anywhere in this subtree.
+        if level and set(level) <= {0, 1}:
+            return []
+        return [_result(self.LEAF, 0.9, level=2, abstract="prefers signed commits",
+                        context_type="memory")]
+
+    async def search_children_in_tenant(self, ctx, parent_uri: str, **kwargs):
+        self.child_search_calls.append({"parent_uri": parent_uri})
+        return []  # dead-end: no record links target -> peer dir -> file
+
+
+@pytest.mark.asyncio
+async def test_thinking_mode_reaches_files_when_intermediate_dirs_are_unindexed(monkeypatch):
+    """Bug B: THINKING mode must not lose results QUICK mode would return."""
+    monkeypatch.setattr(
+        "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
+        lambda config: FakeRerankClient([0.9]),
+    )
+    storage = OrphanSubtreeStorage()
+    retriever = HierarchicalRetriever(
+        storage=storage, embedder=DummyEmbedder(), rerank_config=_config()
+    )
+
+    query = TypedQuery(
+        query="hello",
+        context_type=None,
+        intent="",
+        target_directories=["viking://user/u/memories/preferences"],
+    )
+    result = await retriever.retrieve(
+        query, ctx=_ctx(), limit=5, mode=RetrieverMode.THINKING, score_threshold=0.0
+    )
+
+    uris = [c.uri for c in result.matched_contexts]
+    assert OrphanSubtreeStorage.LEAF in uris, (
+        "THINKING mode dead-ended on unindexed intermediate dirs; "
+        f"got {uris}"
+    )
+    assert result.matched_contexts[0].context_type == ContextType.MEMORY

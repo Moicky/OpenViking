@@ -160,3 +160,72 @@ async def test_recall_hides_persisted_memory_fields_metadata():
     assert "Visible memory body" in result.rendered
     assert "MEMORY_FIELDS" not in result.rendered
     assert "internal-event" not in result.rendered
+
+
+async def test_missing_memory_type_directory_does_not_abort_recall():
+    """Bug A: a never-created memory-type dir must yield [] for that type only.
+
+    search.find raises NotFoundError for type dirs that have never been written.
+    Previously asyncio.gather ran without return_exceptions, so that single
+    failure aborted the whole recall -- including types that would have matched.
+    """
+    from openviking_cli.exceptions import NotFoundError
+
+    hit = {
+        "uri": "viking://user/test_user/memories/preferences/user/pref.md",
+        "abstract": "user prefers signed commits",
+        "score": 0.9,
+    }
+
+    async def fake_find(**kwargs):
+        target = kwargs["target_uri"]
+        if "/preferences" in target:
+            return _FakeFindResult([hit])
+        raise NotFoundError(target, "file")
+
+    service = SimpleNamespace(search=SimpleNamespace(find=fake_find), fs=SimpleNamespace())
+    ctx = RequestContext(
+        user=UserIdentifier.the_default_user("test_user"),
+        role=Role.USER,
+        actor_peer_id="current",
+    )
+
+    result = await search_type_quota_recall(
+        service=service,
+        ctx=ctx,
+        query="commit preferences",
+        peer_scope="actor",
+        quotas={"events": 1, "entities": 1, "preferences": 1, "experiences": 1},
+        min_score=0.0,
+    )
+
+    rendered = str(result.context_block if hasattr(result, "context_block") else result)
+    assert "pref.md" in rendered or "signed commits" in rendered
+
+
+async def test_unrelated_search_errors_still_propagate():
+    """Only missing-target errors are swallowed; real failures must surface."""
+
+    async def fake_find(**kwargs):
+        raise RuntimeError("vector store exploded")
+
+    service = SimpleNamespace(search=SimpleNamespace(find=fake_find), fs=SimpleNamespace())
+    ctx = RequestContext(
+        user=UserIdentifier.the_default_user("test_user"),
+        role=Role.USER,
+        actor_peer_id="current",
+    )
+
+    try:
+        await search_type_quota_recall(
+            service=service,
+            ctx=ctx,
+            query="anything",
+            peer_scope="actor",
+            quotas={"preferences": 1},
+            min_score=0.0,
+        )
+    except RuntimeError as e:
+        assert "exploded" in str(e)
+    else:
+        raise AssertionError("unrelated errors must not be swallowed")

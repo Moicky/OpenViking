@@ -169,6 +169,23 @@ def _abstract(item: Any) -> str:
     return str(_get_attr(item, "abstract", "") or _get_attr(item, "overview", "") or "")
 
 
+async def _safe_find(service: Any, **kwargs: Any) -> Any:
+    """Run ``search.find``, treating a missing target directory as empty.
+
+    A memory-type directory only exists once a memory of that type has been
+    written. Recall fans out over every type in ``TYPE_ORDER``, so on a fresh
+    install most of those targets do not exist yet. That must mean "no
+    memories of this type", not an error that aborts the whole recall.
+    Unrelated failures still propagate.
+    """
+    from openviking_cli.exceptions import NotFoundError
+
+    try:
+        return await service.search.find(**kwargs)
+    except NotFoundError:
+        return None
+
+
 def _extract_memories(result: Any) -> list[Any]:
     if result is None:
         return []
@@ -310,7 +327,8 @@ async def search_type_quota_recall(
 
     async def search_type(memory_type: str, quota: int) -> list[Any]:
         searches = [
-            service.search.find(
+            _safe_find(
+                service,
                 query=query,
                 ctx=ctx,
                 target_uri=_type_target(root, memory_type),
@@ -322,7 +340,8 @@ async def search_type_quota_recall(
         ]
         if peer_scope == "all":
             searches.append(
-                service.search.find(
+                _safe_find(
+                    service,
                     query=query,
                     ctx=open_ctx,
                     target_uri=f"{user_root}/peers",

@@ -162,6 +162,7 @@ async def apply_lexical_fusion(
     ``openviking.retrieve.lexical_fusion`` for the scoring math. Any grep
     failure falls back to the dense-only results.
     """
+    from openviking.core.namespace import context_type_for_uri
     from openviking.retrieve.lexical_fusion import filename_matches, fuse_scores
     from openviking_cli.retrieve.types import ContextType, MatchedContext
 
@@ -171,6 +172,13 @@ async def apply_lexical_fusion(
     pattern = "|".join(re.escape(t) for t in terms)
     try:
         lexical_uris = await grep_uris(pattern)
+    except NotFoundError:
+        # The target subtree does not exist yet (e.g. a memory type directory
+        # written to for the first time). That means "no lexical hits", not a
+        # failure, so keep fusing with an empty lexical side rather than
+        # dropping fusion and logging a traceback for a routine condition.
+        logger.debug("[find] lexical target missing, continuing with dense-only candidates")
+        lexical_uris = []
     except Exception:
         logger.warning("[find] lexical recall failed, dense-only results", exc_info=True)
         return dense_matches[:limit]
@@ -198,7 +206,14 @@ async def apply_lexical_fusion(
                 abstract = await read_abstract(uri)
             except Exception:
                 abstract = ""
-            match = MatchedContext(uri=uri, context_type=ContextType.RESOURCE, abstract=abstract)
+            # Derive the context type from the URI namespace. Hard-coding
+            # RESOURCE here mislabels memory/skill hits, and downstream
+            # consumers (e.g. memory recall) filter strictly by context type.
+            try:
+                lexical_context_type = ContextType(context_type_for_uri(uri))
+            except ValueError:
+                lexical_context_type = ContextType.RESOURCE
+            match = MatchedContext(uri=uri, context_type=lexical_context_type, abstract=abstract)
         match.score = signals["fused"]
         match.signals = {**match.signals, **signals}
         results.append(match)

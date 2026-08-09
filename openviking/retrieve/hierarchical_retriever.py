@@ -297,6 +297,52 @@ class HierarchicalRetriever:
                     initial_candidates=initial_candidates,
                     level=level,
                 )
+            if not candidates:
+                # Recursive descent follows exact parent_uri links. When a
+                # subtree's intermediate directories have no indexed L0/L1
+                # records -- as is the case for memory type directories, which
+                # store files at <type>/<peer>/<topic>.md but index no node for
+                # <type> or <type>/<peer> -- the descent dead-ends at the
+                # target and returns nothing. A flat scoped search still
+                # reaches those files, so fall back to it rather than losing
+                # results that QUICK mode would have returned.
+                with telemetry.measure("search.vector_retrieval"):
+                    flat_results = await vector_proxy.search_in_tenant(
+                        query_vector=query_vector,
+                        sparse_query_vector=sparse_query_vector,
+                        context_type=context_type,
+                        target_directories=target_dirs,
+                        extra_filter=scope_dsl,
+                        level=level,
+                        limit=max(limit, self.GLOBAL_SEARCH_TOPK),
+                    )
+                telemetry.count("vector.searches", 1)
+                fallback: Dict[str, Dict[str, Any]] = {}
+                for flat in flat_results:
+                    uri = flat.get("uri", "")
+                    if not uri:
+                        continue
+                    score = self._finite_score(flat.get("_score", 0.0))
+                    if not self._passes_threshold(score, effective_threshold, score_gte):
+                        continue
+                    previous = fallback.get(uri)
+                    if previous is None or score > previous.get("_final_score", 0.0):
+                        candidate = dict(flat)
+                        candidate["_final_score"] = score
+                        fallback[uri] = candidate
+                candidates = sorted(
+                    fallback.values(),
+                    key=lambda x: x.get("_final_score", 0.0),
+                    reverse=True,
+                )[:limit]
+                if candidates:
+                    logger.debug(
+                        "[retrieve] recursive descent returned nothing for %s; "
+                        "used flat subtree fallback (%d candidates)",
+                        target_dirs,
+                        len(candidates),
+                    )
+
             apply_hotness = True
             rerank_used = self._rerank_client is not None and mode == RetrieverMode.THINKING
 
