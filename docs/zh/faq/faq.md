@@ -138,18 +138,13 @@ pip install openviking --upgrade --force-reinstall
 ### 如何初始化客户端？
 
 ```python
-import openviking as ov
+from openviking_sdk import AsyncHTTPClient
 
-# 异步客户端（推荐）- 嵌入模式
-client = ov.AsyncOpenViking(path="./my_data")
-await client.initialize()
-
-# 异步客户端 - 服务模式
-client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 await client.initialize()
 ```
 
-SDK 构造函数仅接受 `url`、`api_key`、`path` 参数。其他配置（embedding、vlm 等）通过 `ov.conf` 配置文件管理。
+Embedding、VLM、存储等服务配置由 OpenViking Server 通过 `ov.conf` 管理。
 
 ### 支持哪些文件格式？
 
@@ -167,15 +162,15 @@ SDK 构造函数仅接受 `url`、`api_key`、`path` 参数。其他配置（emb
 ```python
 # 添加单个文件
 await client.add_resource(
-    "./document.pdf",
-    reason="项目技术文档",  # 描述资源用途，提升检索质量
-    to="viking://resources/docs/"  # 指定存储位置
+    path="./document.pdf",
+    to="viking://resources/docs/",  # 指定存储位置
+    options={"reason": "项目技术文档"},  # 描述资源用途，提升检索质量
 )
 
 # 添加网页
 await client.add_resource(
-    "https://example.com/api-docs",
-    reason="API 参考文档"
+    path="https://example.com/api-docs",
+    options={"reason": "API 参考文档"},
 )
 
 # 等待处理完成
@@ -194,14 +189,14 @@ await client.wait_processed()
 ```python
 # find(): 简单直接的语义搜索
 results = await client.find(
-    "OAuth 认证流程",
-    target_uri="viking://resources/"
+    query="OAuth 认证流程",
+    target_uri="viking://resources/",
 )
 
 # search(): 复杂任务，需要意图分析
 results = await client.search(
-    "帮我实现用户登录功能",
-    session_info=session
+    query="帮我实现用户登录功能",
+    session_id=session.session_id,
 )
 ```
 
@@ -214,15 +209,21 @@ results = await client.search(
 会话管理是 OpenViking 的核心能力，支持对话追踪和记忆提取：
 
 ```python
+from openviking_sdk import TextPart
+
 # 创建会话
-session = client.session()
+session_info = await client.create_session()
+session = client.session(session_id=session_info["session_id"])
 
 # 添加对话消息
-await session.add_message("user", [{"type": "text", "text": "帮我分析这段代码的性能问题"}])
-await session.add_message("assistant", [{"type": "text", "text": "我来分析一下..."}])
-
-# 标记使用的上下文（用于追踪）
-await session.used(["viking://resources/code/main.py"])
+await session.add_message(
+    role="user",
+    parts=[TextPart(text="帮我分析这段代码的性能问题")],
+)
+await session.add_message(
+    role="assistant",
+    parts=[TextPart(text="我来分析一下...")],
+)
 
 # 提交会话，触发记忆提取
 await session.commit()
@@ -238,16 +239,16 @@ OpenViking 内置 `profile`、`preferences`、`entities`、`events`、`identity`
 
 ```python
 # 列出目录内容
-items = await client.ls("viking://resources/")
+items = await client.ls(uri="viking://resources/")
 
 # 读取完整内容（L2）
-content = await client.read("viking://resources/doc.md")
+content = await client.read(uri="viking://resources/doc.md")
 
 # 获取摘要（L0）
-abstract = await client.abstract("viking://resources")
+abstract = await client.abstract(uri="viking://resources")
 
 # 获取概览（L1）
-overview = await client.overview("viking://resources")
+overview = await client.overview(uri="viking://resources")
 ```
 
 ## 检索优化
@@ -290,7 +291,7 @@ OpenViking 使用分数传播机制：
 
 1. **未等待处理完成**
    ```python
-   await client.add_resource("./doc.pdf")
+   await client.add_resource(path="./doc.pdf")
    await client.wait_processed()  # 必须等待
    ```
 
@@ -315,7 +316,7 @@ OpenViking 使用分数传播机制：
 1. **确认资源已处理完成**
    ```python
    # 检查资源是否存在
-   items = await client.ls("viking://resources/")
+   items = await client.ls(uri="viking://resources/")
    ```
 
 2. **检查 `target_uri` 过滤条件**
@@ -328,7 +329,7 @@ OpenViking 使用分数传播机制：
 
 4. **检查 L0 摘要质量**
    ```python
-   abstract = await client.abstract("viking://resources/your-doc")
+   abstract = await client.abstract(uri="viking://resources/your-doc")
    print(abstract)  # 确认摘要是否准确反映内容
    ```
 
@@ -351,7 +352,10 @@ OpenViking 使用分数传播机制：
 
 4. **查看提取的记忆**
    ```python
-   memories = await client.find("", target_uri="viking://user/memories/")
+   memories = await client.find(
+       query="",
+       target_uri="viking://~/memories/",
+   )
    ```
 
 ### 性能问题
@@ -361,24 +365,9 @@ OpenViking 使用分数传播机制：
 1. **批量处理**：一次添加多个资源比逐个添加更高效
 2. **合理设置 `batch_size`**：Embedding 配置中调整批处理大小
 3. **使用本地存储**：开发阶段使用 `local` 后端减少网络延迟
-4. **异步操作**：充分利用 `AsyncOpenViking` / `AsyncHTTPClient` 的异步特性
+4. **异步操作**：充分利用 `AsyncHTTPClient` 的异步特性
 
 ## 部署相关
-
-### 嵌入式模式和服务模式有什么区别？
-
-| 模式 | 适用场景 | 特点 |
-|------|----------|------|
-| **嵌入式** | 本地开发、单进程应用 | 自动启动 AGFS 子进程，使用本地向量索引 |
-| **服务模式** | 生产环境、分布式部署 | 连接远程服务，支持多实例并发，可独立扩展 |
-
-```python
-# 嵌入式模式
-client = ov.AsyncOpenViking(path="./data")
-
-# 服务模式
-client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
-```
 
 ### OpenViking 是开源的吗？
 

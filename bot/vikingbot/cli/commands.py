@@ -21,6 +21,7 @@ from prompt_toolkit.styles import Style as PromptStyle
 from rich.console import Console
 from rich.table import Table
 
+from openviking.utils.time_utils import parse_iso_datetime
 from vikingbot import __logo__, __version__
 from vikingbot.agent.loop import AgentLoop
 from vikingbot.bus.queue import MessageBus
@@ -319,6 +320,7 @@ def _make_provider(config, langfuse_client: Any = None):
     provider_name = p.provider if p else None
     extra_headers = p.extra_headers if p else {}
     timeout = p.timeout if p else None
+    max_tokens = getattr(p, "max_tokens", None) if p else None
     credentials = list(getattr(p, "credentials", None) or [])
 
     if not model and not credentials:
@@ -345,6 +347,8 @@ def _make_provider(config, langfuse_client: Any = None):
         root_vlm_data["thinking"] = thinking
         if timeout is not None:
             root_vlm_data["timeout"] = timeout
+        if max_tokens is not None:
+            root_vlm_data["max_tokens"] = max_tokens
         if extra_headers:
             root_vlm_data["extra_headers"] = extra_headers
         effective_vlm = VLMConfig.model_validate(root_vlm_data)
@@ -385,6 +389,8 @@ def _make_provider(config, langfuse_client: Any = None):
             bot_vlm_data["provider"] = provider_name
         if timeout is not None:
             bot_vlm_data["timeout"] = timeout
+        if max_tokens is not None:
+            bot_vlm_data["max_tokens"] = max_tokens
         if api_key:
             bot_vlm_data["api_key"] = api_key
         if api_base:
@@ -415,6 +421,8 @@ def _make_provider(config, langfuse_client: Any = None):
         }
         if timeout is not None:
             vlm_config["timeout"] = timeout
+        if max_tokens is not None:
+            vlm_config["max_tokens"] = max_tokens
         if api_key:
             vlm_config["api_key"] = api_key
         if api_base:
@@ -850,7 +858,7 @@ def chat(
     # Use unified default session ID
     if session_id is None:
         session_id = get_or_create_machine_id()
-    cron = prepare_cron(bus, quiet=is_single_turn)
+    cron = None if eval else prepare_cron(bus, quiet=is_single_turn)
     channels = prepare_agent_channel(
         config,
         bus,
@@ -871,7 +879,7 @@ def chat(
         try:
             if is_single_turn:
                 # Single-turn mode: run channels and agent, exit after response
-                task_cron = asyncio.create_task(cron.start())
+                task_cron = asyncio.create_task(cron.start()) if cron is not None else None
                 task_channels = asyncio.create_task(channels.start_all())
                 task_agent = asyncio.create_task(agent_loop.run())
 
@@ -883,15 +891,20 @@ def chat(
                 # Cancel all other tasks
                 for task in pending:
                     task.cancel()
-                task_cron.cancel()
+                if task_cron is not None:
+                    task_cron.cancel()
                 task_agent.cancel()
 
                 # Wait for cancellation
-                await asyncio.gather(task_cron, task_agent, return_exceptions=True)
+                background_tasks = [task_agent]
+                if task_cron is not None:
+                    background_tasks.append(task_cron)
+                await asyncio.gather(*background_tasks, return_exceptions=True)
             else:
                 # Interactive mode: run forever
                 tasks = []
-                tasks.append(cron.start())
+                if cron is not None:
+                    tasks.append(cron.start())
                 tasks.append(channels.start_all())
                 tasks.append(agent_loop.run())
 
@@ -1122,9 +1135,11 @@ def cron_add(
     elif cron_expr:
         schedule = CronSchedule(kind="cron", expr=cron_expr)
     elif at:
-        import datetime
-
-        dt = datetime.datetime.fromisoformat(at)
+        try:
+            dt = parse_iso_datetime(at)
+        except ValueError as e:
+            console.print(f"[red]Error: invalid --at datetime: {e}[/red]")
+            raise typer.Exit(1) from e
         schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
     else:
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
@@ -1135,13 +1150,17 @@ def cron_add(
 
     session_key = SessionKey(type="cli", channel_id="default", chat_id="default")
 
-    job = service.add_job(
-        name=name,
-        schedule=schedule,
-        message=message,
-        deliver=deliver,
-        session_key=session_key,
-    )
+    try:
+        job = service.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=deliver,
+            session_key=session_key,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
 
     console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
 
@@ -1175,7 +1194,11 @@ def cron_enable(
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
-    job = service.enable_job(job_id, enabled=not disable)
+    try:
+        job = service.enable_job(job_id, enabled=not disable)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
     if job:
         status = "disabled" if disable else "enabled"
         console.print(f"[green]✓[/green] Job '{job.name}' {status}")
@@ -1198,10 +1221,16 @@ def cron_run(
     async def run():
         return await service.run_job(job_id, force=force)
 
-    if asyncio.run(run()):
-        console.print("[green]✓[/green] Job executed")
-    else:
+    try:
+        executed = asyncio.run(run())
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    if not executed:
         console.print(f"[red]Failed to run job {job_id}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]✓[/green] Job executed")
 
 
 # ============================================================================

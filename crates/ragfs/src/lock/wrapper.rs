@@ -8,9 +8,8 @@
 //! `PathLockManager`.
 
 use std::sync::Arc;
-use std::time::Duration;
-
 use async_trait::async_trait;
+use tracing::debug;
 
 use crate::core::filesystem::FileSystem;
 use crate::core::internal_names::is_hidden_runtime_lock_name;
@@ -19,9 +18,6 @@ use crate::core::MountableFS;
 
 use super::manager::{AutoPathLockAction, PathLockManager};
 use super::types::{PathLockKind, PathLockRequest};
-
-/// Default timeout for auto-acquired locks.
-const AUTO_LOCK_TIMEOUT: Duration = Duration::ZERO;
 
 /// A `FileSystem` wrapper that auto-acquires path locks for mutating operations.
 pub struct PathLockWrappedFS {
@@ -62,8 +58,9 @@ impl PathLockWrappedFS {
         requests: &[PathLockRequest],
     ) -> crate::core::Result<bool> {
         match self.manager.resolve_auto_pathlock_action(requests).await {
-            Ok(AutoPathLockAction::Disabled | AutoPathLockAction::Covered(_)) => Ok(true),
-            Ok(AutoPathLockAction::Acquire) => Ok(false),
+            Ok(AutoPathLockAction::Disabled) => { debug!(requests = ?requests, "pathlock wrapper skipped auto-lock because context disabled it"); Ok(true) }
+            Ok(AutoPathLockAction::Covered(lease)) => { debug!(lease_ref = %lease.lease.lease_ref, requests = ?requests, "pathlock wrapper skipped auto-lock because active lease already covers request"); Ok(true) }
+            Ok(AutoPathLockAction::Acquire) => { debug!(requests = ?requests, "pathlock wrapper will auto-acquire lease for request"); Ok(false) }
             Err(error) => Err(crate::core::Error::internal(format!(
                 "lock lease error: {error}"
             ))),
@@ -109,7 +106,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .acquire_exact(path, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.create(path).await;
@@ -134,7 +131,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .acquire_exact(path, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.remove(path).await;
@@ -155,7 +152,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_tree(path, AUTO_LOCK_TIMEOUT, None)
+            .acquire_tree(path, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.remove_all(path).await;
@@ -186,7 +183,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .acquire_exact(path, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.write(path, data, offset, flags).await;
@@ -245,7 +242,7 @@ impl FileSystem for PathLockWrappedFS {
 
         let lease = self
             .manager
-            .acquire_batch(&requests, AUTO_LOCK_TIMEOUT, None)
+            .acquire_batch(&requests, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.rename(old_path, new_path).await;
@@ -273,7 +270,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_batch(&requests, AUTO_LOCK_TIMEOUT, None)
+            .acquire_batch(&requests, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.replace(src_path, dst_path).await;
@@ -298,7 +295,7 @@ impl FileSystem for PathLockWrappedFS {
         }
         let lease = self
             .manager
-            .acquire_exact(path, AUTO_LOCK_TIMEOUT, None)
+            .acquire_exact(path, self.manager.default_lock_timeout(), None)
             .await
             .map_err(|e| crate::core::Error::internal(format!("lock error: {e}")))?;
         let result = self.inner.truncate(path, size).await;

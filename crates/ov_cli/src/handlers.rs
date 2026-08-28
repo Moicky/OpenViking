@@ -37,6 +37,7 @@ pub async fn handle_add_resource(
 ) -> Result<()> {
     let is_url =
         path.starts_with("http://") || path.starts_with("https://") || path.starts_with("git@");
+    validate_watch_source(is_url, watch_interval)?;
 
     // A declared Connector add_type sends the path verbatim to the server;
     // it is never a local file, so skip local-path existence validation.
@@ -80,6 +81,9 @@ pub async fn handle_add_resource(
     let effective_include = merge_csv_options(ctx.config.upload.include.clone(), include);
     let effective_exclude = merge_csv_options(ctx.config.upload.exclude.clone(), exclude);
     let add_resource_args = parse_add_resource_args(resource_args.as_deref())?;
+    if let Some(args) = &add_resource_args {
+        reject_manifest_run_keys(args)?;
+    }
 
     let effective_timeout = if wait {
         timeout.unwrap_or(60.0).max(ctx.config.timeout)
@@ -127,7 +131,36 @@ pub async fn handle_add_resource(
     .await
 }
 
-fn parse_add_resource_args(raw: Option<&str>) -> Result<Option<Map<String, Value>>> {
+fn validate_watch_source(is_remote: bool, watch_interval: f64) -> Result<()> {
+    if !is_remote && watch_interval > 0.0 {
+        return Err(Error::Client(
+            "A local path cannot be watched. Use a URL, sitemap, or RSS source, or re-import the local content when it changes."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Single-resource `--args` go to the server as parser options; a manifest-run
+/// key here almost always means a forgotten `-m`. Fail instead of forwarding —
+/// the server treats unknown args keys of shared Connector sources by silently
+/// degrading to the standard pipeline, which would bury the mistake.
+fn reject_manifest_run_keys(args: &Map<String, Value>) -> Result<()> {
+    let run_keys: Vec<&str> = args
+        .keys()
+        .map(String::as_str)
+        .filter(|key| crate::openviking_assets::MANIFEST_RUN_ARG_KEYS.contains(key))
+        .collect();
+    if run_keys.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Client(format!(
+        "--args {} are manifest-run options and need -m/--manifest.",
+        run_keys.join(", ")
+    )))
+}
+
+pub(crate) fn parse_add_resource_args(raw: Option<&str>) -> Result<Option<Map<String, Value>>> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(None);
     };
@@ -244,6 +277,48 @@ fn parse_add_resource_arg_value(raw: &str) -> Value {
     Value::String(unquoted.to_string())
 }
 
+#[cfg(test)]
+mod add_resource_args_tests {
+    use super::*;
+
+    #[test]
+    fn single_resource_mode_rejects_manifest_run_keys() {
+        let args = parse_add_resource_args(Some("dry_run:true,external_connector:true"))
+            .unwrap()
+            .unwrap();
+        let err = reject_manifest_run_keys(&args).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("dry_run"), "{message}");
+        assert!(message.contains("--manifest"), "{message}");
+
+        let server_args = parse_add_resource_args(Some("feishu_access_token:u-xxx"))
+            .unwrap()
+            .unwrap();
+        assert!(reject_manifest_run_keys(&server_args).is_ok());
+    }
+
+    #[test]
+    fn manifest_run_args_share_single_resource_args_syntax() {
+        // Both --args forms of single-resource mode must drive manifest mode
+        // identically: the colon list and the JSON object go through the same
+        // parser, so neither mode grows its own syntax.
+        let colon = parse_add_resource_args(Some(
+            "catalog:shared/catalog.yaml,dry_run:true,skip_failed:false",
+        ))
+        .unwrap();
+        let json = parse_add_resource_args(Some(
+            r#"{"catalog": "shared/catalog.yaml", "dry_run": true, "skip_failed": false}"#,
+        ))
+        .unwrap();
+        assert_eq!(colon, json);
+
+        let run = crate::openviking_assets::parse_manifest_run_args(colon.as_ref()).unwrap();
+        assert_eq!(run.catalog.as_deref(), Some("shared/catalog.yaml"));
+        assert!(run.dry_run);
+        assert!(!run.skip_failed);
+    }
+}
+
 pub async fn handle_add_skill(
     data: String,
     wait: bool,
@@ -264,34 +339,6 @@ pub async fn handle_add_skill(
         ctx.compact,
     )
     .await
-}
-
-pub async fn handle_relations(uri: String, ctx: CliContext) -> Result<()> {
-    let client = ctx.get_client();
-    commands::relations::list_relations(&client, &uri, ctx.output_format, ctx.compact).await
-}
-
-pub async fn handle_link(
-    from_uri: String,
-    to_uris: Vec<String>,
-    reason: String,
-    ctx: CliContext,
-) -> Result<()> {
-    let client = ctx.get_client();
-    commands::relations::link(
-        &client,
-        &from_uri,
-        &to_uris,
-        &reason,
-        ctx.output_format,
-        ctx.compact,
-    )
-    .await
-}
-
-pub async fn handle_unlink(from_uri: String, to_uri: String, ctx: CliContext) -> Result<()> {
-    let client = ctx.get_client();
-    commands::relations::unlink(&client, &from_uri, &to_uri, ctx.output_format, ctx.compact).await
 }
 
 pub async fn handle_export(
@@ -431,8 +478,22 @@ use crate::SessionCommands;
 pub async fn handle_session(cmd: SessionCommands, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
     match cmd {
-        SessionCommands::New => {
-            commands::session::new_session(&client, ctx.output_format, ctx.compact).await
+        SessionCommands::New {
+            session_id,
+            event_tags,
+            auto_commit_policy_json,
+            no_auto_commit,
+        } => {
+            commands::session::new_session(
+                &client,
+                session_id.as_deref(),
+                &event_tags,
+                auto_commit_policy_json.as_deref(),
+                no_auto_commit,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
         }
         SessionCommands::List => {
             commands::session::list_sessions(&client, ctx.output_format, ctx.compact).await
@@ -501,9 +562,41 @@ pub async fn handle_session(cmd: SessionCommands, ctx: CliContext) -> Result<()>
             )
             .await
         }
-        SessionCommands::Commit { session_id } => {
-            commands::session::commit_session(&client, &session_id, ctx.output_format, ctx.compact)
+        SessionCommands::Config { action } => match action {
+            crate::SessionConfigCommands::Set {
+                session_id,
+                event_tags,
+                no_event_tags,
+                auto_commit_policy_json,
+                no_auto_commit,
+            } => {
+                commands::session::set_session_config(
+                    &client,
+                    &session_id,
+                    &event_tags,
+                    no_event_tags,
+                    auto_commit_policy_json.as_deref(),
+                    no_auto_commit,
+                    ctx.output_format,
+                    ctx.compact,
+                )
                 .await
+            }
+        },
+        SessionCommands::Commit {
+            session_id,
+            event_tags,
+            no_event_tags,
+        } => {
+            commands::session::commit_session(
+                &client,
+                &session_id,
+                &event_tags,
+                no_event_tags,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
         }
     }
 }
@@ -530,8 +623,9 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
             )
             .await
         }
-        AdminCommands::ListAccounts => {
-            commands::admin::list_accounts(&client, ctx.output_format, ctx.compact).await
+        AdminCommands::ListAccounts { name, limit, page } => {
+            commands::admin::list_accounts(&client, name, limit, page, ctx.output_format, ctx.compact)
+                .await
         }
         AdminCommands::DeleteAccount { account_id } => {
             commands::admin::delete_account(&client, &account_id, ctx.output_format, ctx.compact)
@@ -564,6 +658,7 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
             limit,
             name,
             role,
+            page,
         } => {
             commands::admin::list_users(
                 &client,
@@ -571,6 +666,7 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
                 limit,
                 name,
                 role,
+                page,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -1210,6 +1306,7 @@ pub async fn handle_write(
     mode: String,
     wait: bool,
     timeout: Option<f64>,
+    processing_mode: String,
     ctx: CliContext,
 ) -> Result<()> {
     let client = ctx.get_client();
@@ -1230,6 +1327,7 @@ pub async fn handle_write(
         &mode,
         wait,
         timeout,
+        &processing_mode,
         ctx.output_format,
         ctx.compact,
     )
@@ -1261,6 +1359,9 @@ pub async fn handle_reindex(
     mode: String,
     wait: bool,
     dry_run: bool,
+    tags: Vec<String>,
+    tag_mode: String,
+    recursive: bool,
     ctx: CliContext,
 ) -> Result<()> {
     let client = ctx.get_client();
@@ -1270,6 +1371,9 @@ pub async fn handle_reindex(
         &mode,
         wait,
         dry_run,
+        tags,
+        &tag_mode,
+        recursive,
         ctx.output_format,
         ctx.compact,
     )
@@ -1292,6 +1396,7 @@ pub async fn handle_find(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1323,6 +1428,9 @@ pub async fn handle_find(
     if let Some(ref t) = tags {
         params.push(format!("--tags {}", t.join(",")));
     }
+    if read_content {
+        params.push("--read-content".to_string());
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov find", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1339,6 +1447,7 @@ pub async fn handle_find(
         level,
         context_type,
         tags,
+        read_content,
         ctx.output_format,
         ctx.compact,
     )
@@ -1357,6 +1466,7 @@ pub async fn handle_search(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1391,6 +1501,9 @@ pub async fn handle_search(
     if let Some(ref t) = tags {
         params.push(format!("--tags {}", t.join(",")));
     }
+    if read_content {
+        params.push("--read-content".to_string());
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov search", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1408,6 +1521,7 @@ pub async fn handle_search(
         level,
         context_type,
         tags,
+        read_content,
         ctx.output_format,
         ctx.compact,
     )
@@ -1750,5 +1864,19 @@ mod config_switch_prompt_tests {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod add_resource_validation_tests {
+    #[test]
+    fn local_watch_is_rejected_before_upload() {
+        let error =
+            super::validate_watch_source(false, 1.0).expect_err("local watch should be rejected");
+
+        assert!(error.to_string().contains("local path cannot be watched"));
+        assert!(super::validate_watch_source(false, 0.0).is_ok());
+        assert!(super::validate_watch_source(false, -1.0).is_ok());
+        assert!(super::validate_watch_source(true, 1.0).is_ok());
     }
 }

@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
-from openviking.storage.queuefs.semantic_processor import DiffResult, SemanticProcessor
+from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.viking_fs import SyncDiff
 
 
 class _FakeVikingFS:
@@ -12,58 +13,52 @@ class _FakeVikingFS:
         return True
 
 
-class _SyncVikingFS:
-    def __init__(self):
-        self.contents = {
-            "viking://temp/import/a.md": "new",
-            "viking://temp/import/b.md": "same",
-            "viking://resources/root/a.md": "old",
-            "viking://resources/root/b.md": "same",
-            "viking://resources/root/.overview.md": "FILES:\n- b.md: old summary",
-            "viking://resources/root/.abstract.md": "old abstract",
-        }
-        self.entries = {
-            "viking://temp/import": [
-                {"name": "a.md", "isDir": False},
-                {"name": "b.md", "isDir": False},
-            ],
-            "viking://resources/root": [
-                {"name": "a.md", "isDir": False},
-                {"name": "b.md", "isDir": False},
-                {"name": ".overview.md", "isDir": False},
-                {"name": ".abstract.md", "isDir": False},
-            ],
-        }
+class _SyncWrapperVikingFS:
+    """Fake FS that verifies the wrapper calls sync_tree and post-processes correctly."""
+
+    def __init__(self, target_exists=True):
+        self.target_exists = target_exists
+        self.sync_tree_calls = []
         self.deleted_temp = []
         self.mutation_leases = []
+        self.sidecar_rewrite_calls = []
 
     async def exists(self, uri, ctx=None):
-        return uri in self.entries
+        if uri.startswith("viking://resources/root"):
+            return self.target_exists
+        return True
 
-    async def ls(self, uri, show_all_hidden=False, node_limit=None, ctx=None):
-        return self.entries.get(uri, [])
+    async def sync_tree(
+        self,
+        root_uri,
+        target_uri,
+        *,
+        ctx=None,
+        file_change_status=None,
+        lease_ref=None,
+        delete_temp_after=False,
+    ):
+        self.sync_tree_calls.append(
+            (root_uri, target_uri, file_change_status, lease_ref, delete_temp_after)
+        )
+        self.mutation_leases.append(("sync_tree", root_uri, target_uri, lease_ref))
+        return SyncDiff(updated_files=["viking://resources/root/a.md"])
 
-    async def stat(self, uri, ctx=None):
-        return {"size": len(self.contents.get(uri, ""))}
+    async def delete_temp(self, uri, ctx=None):
+        self.mutation_leases.append(("delete_temp", uri, None))
+        self.deleted_temp.append(uri)
 
     async def read_file(self, uri, ctx=None):
-        return self.contents.get(uri, "")
+        return "{}"
 
-    async def rm(self, uri, recursive=False, ctx=None, lease_ref=None):
-        self.mutation_leases.append(("rm", uri, lease_ref))
-        self.contents.pop(uri, None)
+    async def stat(self, uri, ctx=None):
+        raise FileNotFoundError(uri)
 
-    async def mv(self, src, dst, ctx=None, lease_ref=None):
-        self.mutation_leases.append(("mv", dst, lease_ref))
-        self.contents[dst] = self.contents.pop(src)
+    async def write_file(self, uri, content, ctx=None, lease_ref=None):
+        self.mutation_leases.append(("write_file", uri, lease_ref))
 
-    async def mkdir(self, uri, exist_ok=False, ctx=None, lease_ref=None):
-        self.mutation_leases.append(("mkdir", uri, lease_ref))
-        self.entries.setdefault(uri, [])
-
-    async def delete_temp(self, uri, ctx=None, lease_ref=None):
-        self.mutation_leases.append(("delete_temp", uri, lease_ref))
-        self.deleted_temp.append(uri)
+    async def glob(self, pattern, uri=None, ctx=None):
+        return {"matches": []}
 
 
 class _FakeDagExecutor:
@@ -105,7 +100,7 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
     processor = SemanticProcessor()
     processor._enqueue_parent_refresh = AsyncMock()
     processor._sync_topdown_recursive = AsyncMock(
-        return_value=DiffResult(
+        return_value=SyncDiff(
             updated_files=["viking://resources/org/repo/a.md"],
         )
     )
@@ -129,8 +124,112 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch):
-    fake_fs = _SyncVikingFS()
+async def test_stale_content_write_keeps_file_work_without_directory_aggregation(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor",
+        _FakeDagExecutor,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.is_semantic_msg_stale",
+        lambda msg: bool(msg.coalesce_key),
+    )
+
+    _FakeDagExecutor.calls = []
+    _FakeDagExecutor.runs = []
+    processor = SemanticProcessor()
+    processor._enqueue_parent_refresh = AsyncMock()
+    changed = "viking://resources/wiki/changed.md"
+    msg = SemanticMsg(
+        uri="viking://resources/wiki",
+        context_type="resource",
+        recursive=False,
+        coalesce_key="resource|wiki",
+        coalesce_version=1,
+        changes={"modified": [changed], "deleted": ["viking://resources/wiki/old.md"]},
+        generation_trigger="content_write",
+    )
+
+    await processor.on_dequeue(msg.to_dict())
+
+    assert _FakeDagExecutor.calls[0]["aggregate_directory"] is False
+    assert _FakeDagExecutor.calls[0]["changes"] == {"modified": [changed]}
+    assert _FakeDagExecutor.calls[0]["coalesce_key"] == ""
+    assert _FakeDagExecutor.runs == ["viking://resources/wiki"]
+    processor._enqueue_parent_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recursive", [False, True])
+async def test_memory_reindex_uses_semantic_dag(monkeypatch, recursive):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor",
+        _FakeDagExecutor,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+
+    _FakeDagExecutor.calls = []
+    _FakeDagExecutor.runs = []
+    processor = SemanticProcessor()
+    processor._process_memory_directory = AsyncMock()
+    msg = SemanticMsg(
+        uri="viking://user/alice/memories/preferences",
+        context_type="memory",
+        recursive=recursive,
+        generation_trigger="reindex",
+        use_hierarchical_aggregation=True,
+    )
+
+    await processor.on_dequeue(msg.to_dict())
+
+    processor._process_memory_directory.assert_not_awaited()
+    assert _FakeDagExecutor.calls[0]["context_type"] == "memory"
+    assert _FakeDagExecutor.calls[0]["recursive"] is recursive
+    assert _FakeDagExecutor.runs == [msg.uri]
+
+
+@pytest.mark.asyncio
+async def test_memory_trigger_does_not_select_hierarchical_aggregation(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+
+    processor = SemanticProcessor()
+    processor._process_memory_directory = AsyncMock()
+    msg = SemanticMsg(
+        uri="viking://user/alice/memories/preferences",
+        context_type="memory",
+        generation_trigger="reindex",
+    )
+
+    await processor.on_dequeue(msg.to_dict())
+
+    processor._process_memory_directory.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_delegates_to_sync_tree_and_cleans_temp(monkeypatch):
+    """The wrapper calls viking_fs.sync_tree and then deletes the temp tree."""
+    fake_fs = _SyncWrapperVikingFS(target_exists=True)
     lease = {
         "lease_ref": "outer-tree-ref",
         "owner_id": "outer-tree-owner",
@@ -140,6 +239,10 @@ async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch)
         "openviking.storage.queuefs.semantic_processor.get_viking_fs",
         lambda: fake_fs,
     )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.rewrite_image_uris",
+        AsyncMock(),
+    )
 
     diff = await SemanticProcessor()._sync_topdown_recursive(
         "viking://temp/import",
@@ -147,24 +250,41 @@ async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch)
         lock=lease,
     )
 
+    assert len(fake_fs.sync_tree_calls) == 1
+    root_uri, target_uri, fcs, lr, dta = fake_fs.sync_tree_calls[0]
+    assert root_uri == "viking://temp/import"
+    assert target_uri == "viking://resources/root"
+    assert lr is lease
+    assert dta is False
     assert diff.to_changes() == {
         "added": [],
         "modified": ["viking://resources/root/a.md"],
         "deleted": [],
     }
-    assert fake_fs.contents["viking://resources/root/a.md"] == "new"
-    assert fake_fs.contents["viking://resources/root/.overview.md"] == (
-        "FILES:\n- b.md: old summary"
-    )
-    assert fake_fs.contents["viking://resources/root/.abstract.md"] == "old abstract"
     assert fake_fs.deleted_temp == ["viking://temp/import"]
-    assert fake_fs.mutation_leases
-    assert all(
-        mutation_lease is lease
-        for operation, _, mutation_lease in fake_fs.mutation_leases
-        if operation != "delete_temp"
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_whole_tree_mv_for_new_target(monkeypatch):
+    """When the target does not exist, sync_tree does a full mv and the wrapper does not delete (source is gone)."""
+    fake_fs = _SyncWrapperVikingFS(target_exists=False)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: fake_fs,
     )
-    assert fake_fs.mutation_leases[-1] == ("delete_temp", "viking://temp/import", None)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.rewrite_image_uris",
+        AsyncMock(),
+    )
+
+    await SemanticProcessor()._sync_topdown_recursive(
+        "viking://temp/import",
+        "viking://resources/root",
+        lock=None,
+    )
+
+    assert len(fake_fs.sync_tree_calls) == 1
+    assert fake_fs.deleted_temp == []  # whole-tree mv already consumed the source
 
 
 @pytest.mark.asyncio
@@ -183,5 +303,5 @@ async def test_sync_missing_source_never_touches_target(monkeypatch):
             lock=None,
         )
 
-    fake_fs.ls.assert_not_awaited()
+    fake_fs.sync_tree.assert_not_awaited()
     fake_fs.rm.assert_not_awaited()

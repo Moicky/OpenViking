@@ -26,7 +26,12 @@ import {
   markRecallCompressorRuntimeFailed,
 } from "./recall-compressor-profile.mjs";
 import { deriveOvSessionId } from "./session-state.mjs";
-import { postRecall } from "./shared/recall-core.mjs";
+import {
+  buildRecallEndpointBody,
+  fetchAssembledContext,
+  normalizeContextEntry,
+  postRecall,
+} from "./shared/recall-core.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
 const cfg = loadConfig();
@@ -87,9 +92,12 @@ recallDeadline = setTimeout(() => {
 }, cfg.recallTimeoutMs);
 recallDeadline.unref?.();
 
-async function fetchJSON(path, init = {}) {
+async function fetchJSON(path, init = {}, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  const timer = setTimeout(
+    () => controller.abort(),
+    Math.max(1000, Number(options.timeoutMs) || cfg.timeoutMs),
+  );
   try {
     const headers = { "Content-Type": "application/json" };
     if (cfg.apiKey) {
@@ -232,13 +240,13 @@ async function searchScope(query, targetUri, limit, bucket = "memories", session
 
 // Candidate target URIs for a bucket, most-specific first. In trusted mode a
 // user's memories live under viking://user/<user>/<bucket>; in api_key mode the
-// server canonicalizes the generic viking://user/<bucket> to the authenticated
-// user. Trying the user-scoped path first with the generic path as a fallback
-// recalls correctly in both modes. De-duped so a missing/blank user never
-// doubles the request count.
+// configured user may be unknown, so the viking://~ home alias lets the server
+// resolve the authenticated caller's own space. Trying the user-scoped path
+// first with the home alias as a fallback recalls correctly in both modes.
+// De-duped so a missing/blank user never doubles the request count.
 function userScopedTargets(kind) {
   const suffix = kind.replace(/^\/+/, "");
-  const targets = [`viking://user/${suffix}`];
+  const targets = [`viking://~/${suffix}`];
   if (cfg.user) {
     targets.unshift(`viking://user/${cfg.user}/${suffix}`);
   }
@@ -299,38 +307,10 @@ async function readMemoryContent(uri) {
   return null;
 }
 
-async function recallViaTypeQuotaEndpoint(query) {
-  const body = {
-    query,
-    quotas: {
-      events: Math.max(cfg.recallLimit, 1),
-      entities: Math.max(cfg.recallLimit, 1),
-      preferences: Math.max(1, Math.min(cfg.recallLimit, 3)),
-      experiences: 0,
-    },
-    max_chars: cfg.recallCompress
-      ? cfg.recallCompressMaxInputChars
-      : DEFAULT_FINAL_RECALL_CHARS,
-    min_score: cfg.scoreThreshold,
-    render: true,
-  };
-  if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
-  const result = await postRecall(fetchJSON, body, { actorPeerId: effectivePeer.peerId, log });
-  if (!result.ok) {
-    log("recall_endpoint_fallback", { status: result.status || 0 });
-    return null;
-  }
-  const rendered = String(result.result?.rendered || "").trim();
-  const entries = Array.isArray(result.result?.entries) ? result.result.entries : [];
+function assembledToRecallResult(rendered, entries) {
   const items = entries
-    .map((entry) => ({
-      uri: String(entry?.uri || "").trim(),
-      category: String(entry?.type || "memory").trim() || "memory",
-      score: clampScore(entry?.score),
-      text: String(
-        entry?.content || entry?.summary || entry?.abstract || entry?.uri || "",
-      ).trim(),
-    }))
+    .map(normalizeContextEntry)
+    .map((entry) => ({ ...entry, score: clampScore(entry.score) }))
     .filter((entry) => entry.uri && entry.text);
   const context = rendered
     ? [
@@ -341,6 +321,41 @@ async function recallViaTypeQuotaEndpoint(query) {
       ].join("\n")
     : "";
   return { context, items };
+}
+
+async function recallViaServerAssembly(query, ovSessionId = "") {
+  const maxInputChars = cfg.recallCompress
+    ? cfg.recallCompressMaxInputChars
+    : DEFAULT_FINAL_RECALL_CHARS;
+  const assembleCfg = {
+    ...cfg,
+    // Local compression happens below, so ask the server for the assembled
+    // block only. The server budget stays independent from the compressor's
+    // input-character ceiling.
+    recallRewrite: "off",
+  };
+
+  const assembled = await fetchAssembledContext(fetchJSON, assembleCfg, query, {
+    actorPeerId: effectivePeer.peerId,
+    sessionId: ovSessionId,
+    log,
+  });
+  if (assembled) {
+    return assembledToRecallResult(assembled.rendered, assembled.entries);
+  }
+
+  const body = buildRecallEndpointBody(cfg);
+  body.query = query;
+  body.max_chars = maxInputChars;
+  const result = await postRecall(fetchJSON, body, { actorPeerId: effectivePeer.peerId, log });
+  if (!result.ok) {
+    log("recall_endpoint_fallback", { status: result.status || 0 });
+    return null;
+  }
+  return assembledToRecallResult(
+    String(result.result?.rendered || "").trim(),
+    Array.isArray(result.result?.entries) ? result.result.entries : [],
+  );
 }
 
 function truncateText(text, maxChars) {
@@ -406,7 +421,7 @@ async function getRecallCompressorProfile() {
 async function runCodexCompressor(prompt, profile) {
   const tmp = await mkdtemp(join(tmpdir(), "ov-recall-compress-"));
   const outputPath = join(tmp, "last-message.txt");
-  const args = buildCodexExecArgs(profile, outputPath);
+  const args = buildCodexExecArgs(profile, outputPath, cfg);
 
   try {
     return await new Promise((resolve) => {
@@ -579,7 +594,7 @@ async function main() {
     return;
   }
 
-  const endpointRecall = await recallViaTypeQuotaEndpoint(userPrompt);
+  const endpointRecall = await recallViaServerAssembly(userPrompt, recallSessionId || "");
   if (endpointRecall !== null) {
     if (!endpointRecall.context && endpointRecall.items.length === 0) {
       log("skip", { stage: "recall_endpoint", reason: "no results" });

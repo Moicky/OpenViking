@@ -5,17 +5,26 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
 import hashlib
 import math
 import os
 import re
+import signal
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from openviking.core.namespace import classify_uri, uri_parts
+from openviking.core.uri_validation import validate_content_target_uri, validate_viking_uri
+from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import require_remote_resource_source
+from openviking.utils.git_auth import (
+    GitHttpAuthConfig,
+    build_git_http_auth_env,
+    reject_git_http_userinfo,
+)
 from openviking_cli.exceptions import (
     DeadlineExceededError,
     InvalidArgumentError,
@@ -27,6 +36,7 @@ from openviking_cli.exceptions import (
 PROTOCOL = "openviking-assets/1"
 GIT_PREFLIGHT_TIMEOUT_SECONDS = 15.0
 _ASSET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _REMOTE_HELPER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
 _NETWORK_FAILURE_PATTERNS = (
     "could not resolve host",
@@ -56,6 +66,7 @@ class _CatalogAsset(_StrictModel):
     name: str
     connector: str
     description: str = ""
+    to: str | None = None
     params: dict[str, Any]
     auth_ref: str | None = None
     watch_interval: float | None = None
@@ -64,10 +75,17 @@ class _CatalogAsset(_StrictModel):
 class _Catalog(_StrictModel):
     protocol: str
     defaults: _Defaults | None = None
-    assets: list[_CatalogAsset]
+    catalog: list[_CatalogAsset]
 
 
 class _Manifest(_StrictModel):
+    """One build: asset definitions under ``catalog``, chosen names under ``assets``.
+
+    ``catalog`` holds the definitions themselves, inline here or supplied as a
+    separate catalog file. ``assets`` names which of them this build applies;
+    omitting it applies every defined asset.
+    """
+
     protocol: str | None = None
     defaults: _Defaults | None = None
     catalog: list[_CatalogAsset] | str | None = None
@@ -78,6 +96,7 @@ class _Manifest(_StrictModel):
 class _GitParams(_StrictModel):
     repo_url: str
     branch: str | None = None
+    commit: str | None = None
 
 
 class ResolvedAsset(_StrictModel):
@@ -85,8 +104,10 @@ class ResolvedAsset(_StrictModel):
 
     name: str
     connector: str
+    to: str | None = None
     repo_url: str
     branch: str | None = None
+    commit: str | None = None
     auth_ref: str | None = None
     watch_interval: float
     locator: str
@@ -126,6 +147,38 @@ def _check_watch_interval(value: float | None, where: str) -> float | None:
     if value is not None and (not math.isfinite(value) or value < 0):
         raise InvalidArgumentError(f"{where}: 'watch_interval' must be >= 0")
     return value
+
+
+def _normalize_asset_target_uri(
+    value: str | None,
+    where: str,
+    ctx: RequestContext | None,
+) -> str | None:
+    """Validate one optional exact resource target and return its normalized URI."""
+
+    if value is None:
+        return None
+    target = value.strip()
+    if not target:
+        raise InvalidArgumentError(f"{where}: 'to' must be a non-empty string when set")
+
+    if ctx is not None:
+        # Use the same request-boundary URI, namespace-shape and access checks as
+        # add_resource itself. In particular, this expands the viking://~ home
+        # alias before the plan reaches the CLI and its local State file.
+        return validate_content_target_uri(target, ctx, kind="resource", field_name="to")
+
+    # Direct resolver callers do not always have a request identity. Preserve
+    # that API while still enforcing the public URI grammar and resource shape;
+    # HTTP callers take the context-aware path above.
+    normalized = validate_viking_uri(target, field_name="to").rstrip("/")
+    parts = uri_parts(normalized)
+    classification = classify_uri(normalized)
+    if parts[:1] == ["resources"] or (
+        classification.context_type == "resource" and classification.content_index is not None
+    ):
+        return normalized
+    raise InvalidArgumentError(f"{where}: 'to' must target resource content")
 
 
 def _strip_port(host: str) -> str:
@@ -194,6 +247,17 @@ def _asset_id(connector: str, locator: str, git_ref: str) -> str:
     return hashlib.sha1(identity).hexdigest()[:12]  # noqa: S324 - stable identity, not security
 
 
+def _normalize_commit_sha(commit: str | None, where: str) -> str | None:
+    if commit is None:
+        return None
+    normalized = commit.strip()
+    if not normalized:
+        raise InvalidArgumentError(f"{where}: commit must be a non-empty string when set")
+    if not _FULL_COMMIT_SHA_RE.fullmatch(normalized):
+        raise InvalidArgumentError(f"{where}: commit must be a full 40-character hexadecimal SHA")
+    return normalized.lower()
+
+
 def _append_git_process_config(env: dict[str, str], key: str, value: str) -> None:
     """Append one process-local Git config entry without putting secrets in argv."""
 
@@ -211,6 +275,7 @@ async def preflight_git_repository(
     asset_name: str,
     repo_url: str,
     branch: str | None = None,
+    commit: str | None = None,
     username: str | None = None,
     token: str | None = None,
     timeout: float = GIT_PREFLIGHT_TIMEOUT_SECONDS,
@@ -218,6 +283,7 @@ async def preflight_git_repository(
     """Verify that the server can read a Git source without cloning or creating a task."""
 
     _validate_clone_url(repo_url, asset_name)
+    reject_git_http_userinfo(repo_url)
     repo_url = require_remote_resource_source(repo_url)
     if timeout <= 0 or not math.isfinite(timeout):
         raise InvalidArgumentError("Git preflight timeout must be a positive finite number")
@@ -227,12 +293,18 @@ async def preflight_git_repository(
         raise InvalidArgumentError(
             f"asset '{asset_name}': branch must be a non-empty string when set"
         )
+    normalized_commit = _normalize_commit_sha(commit, f"asset '{asset_name}'")
+    if normalized_branch and normalized_commit:
+        raise InvalidArgumentError(
+            f"asset '{asset_name}': branch and commit are mutually exclusive"
+        )
+    git_ref = normalized_commit or normalized_branch
 
     normalized_token = token or ""
     normalized_username = (username or ("oauth2" if normalized_token else "")).strip()
-    if normalized_token and not repo_url.strip().lower().startswith(("http://", "https://")):
+    if normalized_token and not repo_url.strip().lower().startswith("https://"):
         raise InvalidArgumentError(
-            f"asset '{asset_name}': token authentication requires an HTTP(S) Git URL"
+            f"asset '{asset_name}': token authentication requires an HTTPS Git URL"
         )
     if normalized_token and not normalized_username:
         raise InvalidArgumentError(
@@ -246,11 +318,11 @@ async def preflight_git_repository(
     if normalized_token:
         # An explicit auth_ref must be authoritative: disable credential-helper
         # fallback and pass HTTP Basic auth through process-local config.
-        _append_git_process_config(env, "credential.helper", "")
-        encoded = base64.b64encode(
-            f"{normalized_username}:{normalized_token}".encode()
-        ).decode()
-        _append_git_process_config(env, "http.extraHeader", f"Authorization: Basic {encoded}")
+        env = build_git_http_auth_env(
+            GitHttpAuthConfig(username=normalized_username, token=normalized_token),
+            repo_url,
+            base_env=env,
+        )
     elif normalized_username:
         _append_git_process_config(env, "credential.username", normalized_username)
 
@@ -263,6 +335,10 @@ async def preflight_git_repository(
             ]
         )
     else:
+        # ls-remote cannot prove that an arbitrary historical commit is
+        # reachable. For a pinned commit, preflight therefore verifies repository
+        # access via HEAD; the import pipeline validates the exact SHA when it
+        # fetches and checks out the commit.
         command.append("HEAD")
 
     try:
@@ -271,16 +347,24 @@ async def preflight_git_repository(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError as exc:
         raise UnavailableError("git", "executable not found on the OpenViking Server") from exc
 
     try:
         _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except TimeoutError as exc:
-        process.kill()
-        await process.communicate()
-        raise DeadlineExceededError("Git repository permission preflight", timeout) from exc
+    except BaseException as exc:
+        with contextlib.suppress(ProcessLookupError):
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(process.communicate()), timeout=1.0)
+        if isinstance(exc, asyncio.TimeoutError):
+            raise DeadlineExceededError("Git repository permission preflight", timeout) from exc
+        raise
 
     locator = normalize_repo_url(repo_url)
     if process.returncode == 0:
@@ -288,7 +372,7 @@ async def preflight_git_repository(
             "name": asset_name,
             "connector": "git",
             "locator": locator,
-            "git_ref": normalized_branch,
+            "git_ref": git_ref,
             "accessible": True,
         }
 
@@ -312,7 +396,8 @@ def resolve_openviking_assets(
     manifest_yaml: str,
     catalog_yaml: str | None = None,
     manifest_label: str = "manifest.yaml",
-    catalog_label: str = "assets.yaml",
+    catalog_label: str = "catalog.yaml",
+    ctx: RequestContext | None = None,
 ) -> ResolveResult:
     """Parse and resolve one flat manifest, optionally against a separate catalog.
 
@@ -352,7 +437,7 @@ def resolve_openviking_assets(
                 f"manifest '{manifest_label}': 'protocol' is required when the manifest "
                 f"defines 'catalog' (expected '{PROTOCOL}')"
             )
-        catalog = _Catalog(protocol=PROTOCOL, defaults=manifest.defaults, assets=manifest.catalog)
+        catalog = _Catalog(protocol=PROTOCOL, defaults=manifest.defaults, catalog=manifest.catalog)
         catalog_label = manifest_label
     else:
         if manifest.defaults is not None:
@@ -387,7 +472,7 @@ def resolve_openviking_assets(
     if manifest.assets is None and manifest.catalog is not None:
         # A single-file manifest without an explicit selection applies everything
         # it defines; duplicate definition names are rejected below.
-        names = [asset.name for asset in catalog.assets]
+        names = [asset.name for asset in catalog.catalog]
     if not names:
         raise InvalidArgumentError(f"manifest '{manifest_label}' selects no assets")
 
@@ -403,7 +488,7 @@ def resolve_openviking_assets(
         default_watch = 0.0
 
     catalog_by_name: dict[str, _CatalogAsset] = {}
-    for asset in catalog.assets:
+    for asset in catalog.catalog:
         where = f"catalog '{catalog_label}' asset '{asset.name}'"
         if not _ASSET_NAME_RE.fullmatch(asset.name):
             raise InvalidArgumentError(
@@ -439,9 +524,19 @@ def resolve_openviking_assets(
 
     resolved: list[ResolvedAsset] = []
     identity_names: dict[str, str] = {}
+    target_names: dict[str, str] = {}
     for name in names:
         asset = catalog_by_name[name]
         where = f"catalog '{catalog_label}' asset '{name}'"
+        target = _normalize_asset_target_uri(asset.to, where, ctx)
+        if target is not None:
+            if target in target_names:
+                other = target_names[target]
+                raise InvalidArgumentError(
+                    f"assets '{other}' and '{name}' declare the same target URI '{target}'; "
+                    "each selected asset must use a unique 'to'"
+                )
+            target_names[target] = name
         try:
             params = _GitParams.model_validate(asset.params)
         except ValidationError as exc:
@@ -453,8 +548,13 @@ def resolve_openviking_assets(
             raise InvalidArgumentError(
                 f"{where}: params.branch must be a non-empty string when set"
             )
+        commit = _normalize_commit_sha(params.commit, f"{where}: params")
+        if branch and commit:
+            raise InvalidArgumentError(
+                f"{where}: params.branch and params.commit are mutually exclusive"
+            )
         locator = normalize_repo_url(repo_url)
-        git_ref = branch or ""
+        git_ref = commit or branch or ""
         asset_id = _asset_id(asset.connector, locator, git_ref)
         if asset_id in identity_names:
             other = identity_names[asset_id]
@@ -468,8 +568,10 @@ def resolve_openviking_assets(
             ResolvedAsset(
                 name=name,
                 connector=asset.connector,
+                to=target,
                 repo_url=repo_url,
                 branch=branch,
+                commit=commit,
                 auth_ref=asset.auth_ref or default_auth_ref,
                 watch_interval=(
                     asset.watch_interval if asset.watch_interval is not None else default_watch

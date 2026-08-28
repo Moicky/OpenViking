@@ -16,10 +16,11 @@
 
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { isBypassed, makeFetchJSON } from "./lib/ov-session.mjs";
+import { deriveOvSessionId, isBypassed, makeFetchJSON } from "./lib/ov-session.mjs";
 import { writeJsonState } from "./lib/state.mjs";
+import { createHostCompressor } from "./lib/host-compressor.mjs";
 import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
-import { postRecall } from "./shared/recall-core.mjs";
+import { buildServerAssembledBlock } from "./shared/recall-core.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -152,6 +153,11 @@ async function resolveUserSpace(actorPeerId = "") {
 
 async function resolveTargetUri(targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
+  // viking://~ is the home alias: the server expands it to the caller's own user
+  // space, so it needs no client-side rewrite.
+  if (trimmed === "viking://~" || trimmed.startsWith("viking://~/")) return trimmed;
+  // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
+  // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
   if (!m) return trimmed;
   const rawRest = (m[1] ?? "").trim();
@@ -169,8 +175,8 @@ async function resolveTargetUri(targetUri, actorPeerId = "") {
 // ---------------------------------------------------------------------------
 
 const SOURCES = [
-  { type: "memory", uri: "viking://user/memories",  bucket: "memories" },
-  { type: "skill",  uri: "viking://user/skills",    bucket: "skills"   },
+  { type: "memory", uri: "viking://~/memories",  bucket: "memories" },
+  { type: "skill",  uri: "viking://~/skills",    bucket: "skills"   },
 ];
 
 async function searchOneSource(query, source, limit, actorPeerId = "") {
@@ -293,33 +299,15 @@ async function buildInjectionBlock(items, actorPeerId = "") {
   return { block: lines.join("\n"), contentCount, hintCount, budgetUsed };
 }
 
-async function recallViaTypeQuotaEndpoint(query, actorPeerId = "") {
-  const body = {
-    query,
-    quotas: {
-      events: Math.max(cfg.recallLimit, 1),
-      entities: Math.max(cfg.recallLimit, 1),
-      preferences: Math.max(1, Math.min(cfg.recallLimit, 3)),
-      experiences: 0,
-    },
-    max_chars: Math.max(cfg.recallMaxContentChars * Math.max(cfg.recallLimit, 1), 1000),
-    min_score: cfg.scoreThreshold,
-    render: true,
-  };
-  if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
-  const res = await postRecall(fetchJSON, body, { actorPeerId, log });
-  if (!res.ok) {
-    log("recall_endpoint_fallback", { status: res.status || 0 });
-    return null;
-  }
-  const rendered = String(res.result?.rendered || "").trim();
-  if (!rendered) return "";
-  return [
-    "<openviking-context>",
-    "Relevant memory from OpenViking. Use the recall/read MCP tools to expand URIs.",
-    rendered,
-    "</openviking-context>",
-  ].join("\n");
+async function recallViaServerAssembly(query, actorPeerId = "", sessionId = "") {
+  const runCompressor = await createHostCompressor(cfg, log);
+  return buildServerAssembledBlock(fetchJSON, cfg, query, {
+    actorPeerId,
+    sessionId,
+    log,
+    runCompressor,
+    localCompressorAvailable: Boolean(runCompressor),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +383,14 @@ async function main() {
     return;
   }
 
-  const endpointBlock = await recallViaTypeQuotaEndpoint(userPrompt, effectivePeer.peerId);
+  // The OV session id is what unlocks server-side query expansion and the
+  // cross-turn dedup ledger; it must match the id auto-capture writes to.
+  const ovSessionId = sessionId && sessionId !== "unknown" ? deriveOvSessionId(sessionId) : "";
+  const endpointBlock = await recallViaServerAssembly(
+    userPrompt,
+    effectivePeer.peerId,
+    ovSessionId,
+  );
   if (endpointBlock !== null) {
     if (!endpointBlock) {
       log("skip", { reason: "recall_endpoint_no_results" });
@@ -404,12 +399,11 @@ async function main() {
       return;
     }
     writeRecallState({
-      count: 1,
+      count: new Set(endpointBlock.match(/viking:\/\/[^\s<>"')\]]+/g) || []).size,
       content_items: 1,
       hint_items: 0,
       tokens_used: estimateTokens(endpointBlock),
       tokens_budget: cfg.recallTokenBudget,
-      top_score: 0,
       cc_session_id: sessionId,
       reason: "ok",
     });
@@ -446,14 +440,12 @@ async function main() {
   }
 
   const built = await buildInjectionBlock(picked, effectivePeer.peerId);
-  const topScore = picked.reduce((m, it) => Math.max(m, clampScore(it.score)), 0);
   writeRecallState({
     count: picked.length,
     content_items: built?.contentCount ?? 0,
     hint_items: built?.hintCount ?? 0,
     tokens_used: built?.budgetUsed ?? 0,
     tokens_budget: cfg.recallTokenBudget,
-    top_score: topScore,
     cc_session_id: sessionId,
     reason: "ok",
   });

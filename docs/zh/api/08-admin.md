@@ -59,8 +59,8 @@ Admin API 用于多租户环境下的账户和用户管理。包括工作区（a
 
 ### get_agent_evolution_status
 
-返回实例级 Agent 进化开关的实时状态和已配置的默认 account ID。该接口仅限
-ROOT 调用。
+返回调用方所属 account 的 Agent 进化实时状态。ROOT 操作已配置的默认
+account，ADMIN 仅操作自己所属的 account。
 
 **HTTP API**
 
@@ -86,9 +86,62 @@ curl http://localhost:1933/api/v1/admin/agent-evolution \
 }
 ```
 
-`enabled` 来自 session commit 实际使用的
-`server.agent_evolution.enabled` 实时值；`account_id` 是部署配置的默认
-account。
+`enabled` 优先读取
+`/local/{account_id}/_system/setting.json` 中的 account 级覆盖值；未配置时使用
+`server.agent_evolution.enabled`。Session commit 会实时读取生效值，无需重启。
+
+现有更新接口名保持不变：
+
+```http
+PUT /api/v1/admin/agent-evolution
+Content-Type: application/json
+
+{"enabled": true}
+```
+
+### account_settings
+
+ROOT 可管理任意 account，ADMIN 仅可管理自己所属的 account。通用配置接口仅允许
+显式列入白名单的字段；当前只允许修改 `agent_evolution.enabled`。
+
+```http
+GET /api/v1/admin/accounts/{account_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/settings
+Content-Type: application/json
+
+{"agent_evolution": {"enabled": true}}
+```
+
+覆盖已有配置前，内核会先备份到
+`/local/{account_id}/_system/setting.backup.json`。
+
+### user_settings
+
+ROOT 可管理任意 User，ADMIN 仅可管理所属 account 内的 User。User 配置接口当前
+仅允许修改 `memory_policy`。顶层统一的 `memory_types` 控制允许抽取的记忆类型。
+用户记忆根据每条 Message 的 `peer_id` 自动写入 Self 或 Peer；Agent 记忆始终只写入
+Self。
+
+```http
+GET /api/v1/admin/accounts/{account_id}/users/{user_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings
+Content-Type: application/json
+
+{
+  "memory_policy": {
+    "memory_types": ["profile", "preferences", "events", "entities", "experiences"]
+  }
+}
+```
+
+响应直接返回 User 级 `memory_policy`，并展开默认记忆类型和 Agent 记忆依赖；配置
+`experiences` 时会展开为 `cases`、`trajectories`、`experiences`；
+该结果不受 account 级 Agent 进化开关影响，Account 开关由独立接口管理。
+更新前会备份到该 User 的 `settings/user_config.backup.json`。未显式配置策略的
+Session 在 commit 时读取该 User 最新策略；User 未覆盖时，依次回退到
+`server.user_config_defaults.memory_policy` 和内核默认策略。若要清除已持久化的
+User override 并重新继承上述默认值，请 PATCH `{"memory_policy": null}`。
+`{"memory_policy": {}}` 表示显式策略，不会清除 override。
 
 ---
 
@@ -120,14 +173,15 @@ account。
 | account_id | str | 是 | - | 工作区 ID |
 | admin_user_id | str | 是 | - | 首个管理员用户 ID |
 | seed | str | 否 | `null` | 可选的确定性 API Key seed。传入后，key secret 为 `sha256(user_id + "\0" + seed)` |
-| user_config | object | 否 | `null` | 首个管理员用户的初始配置。当前支持 `add_targets.resource_uri` 和 `add_targets.skill_uri` |
+| user_config | object | 否 | `null` | 首个管理员用户的初始配置。支持 `add_targets.resource_uri`、`add_targets.skill_uri` 和 `memory_policy` |
 
 **说明：**
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
 - 省略 `seed` 时使用默认随机 API Key。seed 应视为密钥材料；过短的 seed 会让 key 更容易被猜测。
 - 不再支持 account 级 namespace 隔离配置。用户记忆使用 user-scoped namespace，一对多外部参与者通过 `peer_id` 表达。
-- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://user/resources` 或 `viking://user/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
-- `user_config.add_targets.skill_uri` 只能是 `viking://user/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
+- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://~/resources` 或 `viking://~/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
+- `user_config.add_targets.skill_uri` 只能是 `viking://~/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
+- 旧写法兼容：`viking://user/resources[/...]` 和 `viking://user/skills` 在这里仍会被接受，并归一化为 `viking://~/...` 形式（服务端会打印一条 info 日志）。在其他位置，无 uid 的写法会在请求入口被拒绝——新配置请直接写 `viking://~/...`。
 
 #### 3. 使用示例
 
@@ -192,18 +246,22 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_create_account("acme", "alice", seed="alice-seed")
+result = client.admin_create_account(
+    account_id="acme",
+    admin_user_id="alice",
+    seed="alice-seed",
+)
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_create_account(
-    "acme-private",
-    "alice",
+    account_id="acme-private",
+    admin_user_id="alice",
     user_config={
         "add_targets": {
-            "resource_uri": "viking://user/resources",
-            "skill_uri": "viking://user/skills",
+            "resource_uri": "viking://~/resources",
+            "skill_uri": "viking://~/skills",
         }
     },
 )
@@ -229,8 +287,8 @@ result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice",
     Seed: &seed,
     UserConfig: map[string]any{
         "add_targets": map[string]any{
-            "resource_uri": "viking://user/resources",
-            "skill_uri":    "viking://user/skills",
+            "resource_uri": "viking://~/resources",
+            "skill_uri":    "viking://~/skills",
         },
     },
 })
@@ -244,7 +302,7 @@ ov --sudo admin create-account acme --admin alice
 ov --sudo admin create-account acme --admin alice --seed alice-seed
 
 ov --sudo admin create-account acme-private --admin alice \
-  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources","skill_uri":"viking://user/skills"}}'
+  --user-config-json '{"add_targets":{"resource_uri":"viking://~/resources","skill_uri":"viking://~/skills"}}'
 ```
 
 **响应示例**
@@ -271,8 +329,10 @@ ov --sudo admin create-account acme-private --admin alice \
 
 **处理流程：**
 1. 验证请求者具有 ROOT 权限
-2. 调用 API Key Manager 获取所有账户列表
-3. 返回包含账户 ID、创建时间和用户数量的列表
+2. 调用 API Key Manager 获取所有账户列表（按账户 ID 字典序排列）
+3. 应用可选的 `name` 过滤
+4. 应用可选的 `limit`/`page` 分页
+5. 返回包含账户 ID、创建时间和用户数量的列表
 
 **代码入口：**
 - `openviking/server/routers/admin.py:list_accounts` - HTTP 路由
@@ -281,7 +341,13 @@ ov --sudo admin create-account acme-private --admin alice \
 
 #### 2. 接口和参数说明
 
-无参数。
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| name | str | 否 | null | 按账户 ID 过滤（通配符 `*` 和 `?` 匹配） |
+| limit | int | 否 | null | 每页数量（≥1）。省略则返回所有匹配项 |
+| page | int | 否 | 1 | 从 1 开始的页码；仅在设置了 `limit` 时生效 |
+
+结果始终按账户 ID 字典序返回。
 
 #### 3. 使用示例
 
@@ -292,7 +358,16 @@ GET /api/v1/admin/accounts
 ```
 
 ```bash
+# 列出所有账户
 curl -X GET http://localhost:1933/api/v1/admin/accounts \
+  -H "X-API-Key: <root-key>"
+
+# 带过滤条件（通配符 name 匹配）
+curl -X GET "http://localhost:1933/api/v1/admin/accounts?name=*acme*" \
+  -H "X-API-Key: <root-key>"
+
+# 分页（每页 50，取第 2 页）
+curl -X GET "http://localhost:1933/api/v1/admin/accounts?limit=50&page=2" \
   -H "X-API-Key: <root-key>"
 ```
 
@@ -304,7 +379,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-accounts = client.admin_list_accounts()
+accounts = client.admin_list_accounts(name="*acme*", limit=50, page=1)
 for account in accounts:
     print(f"Account: {account['account_id']}, created: {account['created_at']}, users: {account['user_count']}")
 ```
@@ -312,7 +387,7 @@ for account in accounts:
 **TypeScript SDK**
 
 ```typescript
-console.log(await client.adminListAccounts());
+console.log(await client.adminListAccounts({ name: "*acme*", limit: 50, page: 1 }));
 ```
 
 **Go SDK**
@@ -330,6 +405,12 @@ fmt.Println(accounts)
 ```bash
 # 需要 ROOT 权限，使用 --sudo
 ov --sudo admin list-accounts
+
+# 按通配符 name 过滤
+ov --sudo admin list-accounts --name '*acme*'
+
+# 分页
+ov --sudo admin list-accounts --limit 50 --page 2
 ```
 
 **响应示例**
@@ -397,7 +478,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_delete_account("acme")
+result = client.admin_delete_account(account_id="acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
@@ -466,15 +547,16 @@ ov --sudo admin delete-account acme
 | user_id | str | 是 | - | 用户 ID |
 | role | str | 否 | "user" | 要分配的角色。`ROOT` 和同 account 的 `ADMIN` 可直接注册 `"user"` 或 `"admin"`。ROOT 身份只来自 `server.root_api_key`。 |
 | seed | str | 否 | `null` | 可选的确定性 API Key seed。传入后，key secret 为 `sha256(user_id + "\0" + seed)` |
-| user_config | object | 否 | `null` | 新用户的初始配置。当前支持 `add_targets.resource_uri` 和 `add_targets.skill_uri` |
+| user_config | object | 否 | `null` | 新用户的初始配置。支持 `add_targets.resource_uri`、`add_targets.skill_uri` 和 `memory_policy` |
 
 **说明：**
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
 - 省略 `seed` 时使用默认随机 API Key。seed 应视为密钥材料；过短的 seed 会让 key 更容易被猜测。
 - ADMIN 只能在自己所属的 account 中注册用户
 - 无法通过用户注册接口直接创建 `"root"` 角色
-- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://user/resources` 或 `viking://user/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
-- `user_config.add_targets.skill_uri` 只能是 `viking://user/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
+- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://~/resources` 或 `viking://~/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
+- `user_config.add_targets.skill_uri` 只能是 `viking://~/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
+- 旧写法兼容：`viking://user/resources[/...]` 和 `viking://user/skills` 在这里仍会被接受，并归一化为 `viking://~/...` 形式（服务端会打印一条 info 日志）。在其他位置，无 uid 的写法会在请求入口被拒绝——新配置请直接写 `viking://~/...`。
 
 #### 3. 使用示例
 
@@ -503,15 +585,20 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_register_user("acme", "bob", role="user", seed="bob-seed")
+result = client.admin_register_user(
+    account_id="acme",
+    user_id="bob",
+    role="user",
+    seed="bob-seed",
+)
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_register_user(
-    "acme",
-    "bob-private",
+    account_id="acme",
+    user_id="bob-private",
     role="user",
-    user_config={"add_targets": {"resource_uri": "viking://user/resources/project-a"}},
+    user_config={"add_targets": {"resource_uri": "viking://~/resources/project-a"}},
 )
 ```
 
@@ -534,7 +621,7 @@ seed := "bob-seed"
 result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "user", &openviking.AdminRegisterUserOptions{
     Seed: &seed,
     UserConfig: map[string]any{
-        "add_targets": map[string]any{"resource_uri": "viking://user/resources/project-a"},
+        "add_targets": map[string]any{"resource_uri": "viking://~/resources/project-a"},
     },
 })
 ```
@@ -550,7 +637,7 @@ ov admin register-user acme bob --role user --seed bob-seed
 ov --sudo admin register-user acme bob --role user
 
 ov admin register-user acme bob-private --role user \
-  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources/project-a"}}'
+  --user-config-json '{"add_targets":{"resource_uri":"viking://~/resources/project-a"}}'
 ```
 
 **响应示例**
@@ -573,13 +660,14 @@ ov admin register-user acme bob-private --role user \
 
 #### 1. API 实现介绍
 
-列出工作区中的所有用户。
+列出工作区中的活跃用户。正在删除中的用户不会返回。
 
 **处理流程：**
 1. 验证请求者具有 ROOT 权限，或为本账户的 ADMIN
-2. 调用 API Key Manager 获取用户列表
-3. 应用可选的过滤条件（name、role）和分页限制
-4. 返回用户列表（trusted 模式下不包含 user_key）
+2. 调用 API Key Manager 获取活跃用户列表（按用户 ID 字典序排列）
+3. 应用可选的过滤条件（name、role）
+4. 应用可选的 `limit`/`page` 分页
+5. 返回用户列表（trusted 模式下不包含 user_key）
 
 **代码入口：**
 - `openviking/server/routers/admin.py:list_users` - HTTP 路由
@@ -593,13 +681,16 @@ ov admin register-user acme bob-private --role user \
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | account_id | str | 是 | - | 工作区 ID |
-| limit | int | 否 | 100 | 返回用户数量上限 |
-| name | str | 否 | null | 按用户 ID 过滤（前缀匹配） |
+| name | str | 否 | null | 按用户 ID 过滤（通配符 `*` 和 `?` 匹配） |
 | role | str | 否 | null | 按角色过滤 |
+| limit | int | 否 | null | 每页数量（≥1）。省略则返回所有匹配项 |
+| page | int | 否 | 1 | 从 1 开始的页码；仅在设置了 `limit` 时生效 |
 
 **说明：**
+- 结果始终按用户 ID 字典序返回
 - ADMIN 只能列出自己所属的 account 中的用户
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
+- 用户删除开始后，不再出现在该列表中
 
 #### 3. 使用示例
 
@@ -614,8 +705,12 @@ GET /api/v1/admin/accounts/{account_id}/users
 curl -X GET http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <root-or-admin-key>"
 
-# 带过滤条件
-curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?role=admin&limit=50" \
+# 带过滤条件（通配符 name 匹配）
+curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?name=*ali*&role=admin" \
+  -H "X-API-Key: <root-or-admin-key>"
+
+# 分页（每页 50，取第 2 页）
+curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?limit=50&page=2" \
   -H "X-API-Key: <root-or-admin-key>"
 ```
 
@@ -627,7 +722,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-users = client.admin_list_users("acme")
+users = client.admin_list_users(account_id="acme", name="*ali*", limit=50, page=1)
 for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
 ```
@@ -635,7 +730,7 @@ for user in users:
 **TypeScript SDK**
 
 ```typescript
-console.log(await client.adminListUsers("account-id"));
+console.log(await client.adminListUsers("account-id", { name: "*ali*", limit: 50, page: 1 }));
 ```
 
 **Go SDK**
@@ -656,6 +751,10 @@ fmt.Println(users)
 ov admin list-users acme
 # 如果使用 root_api_key（--sudo）：
 ov --sudo admin list-users acme
+# 按通配符 name 过滤
+ov admin list-users acme --name '*ali*'
+# 分页
+ov admin list-users acme --limit 50 --page 2
 ```
 
 **响应示例**
@@ -677,16 +776,17 @@ ov --sudo admin list-users acme
 
 #### 1. API 实现介绍
 
-从工作区中移除用户，同时删除其 API Key。
+从工作区中移除用户。用户 API Key 会立即失效，其拥有的数据清理异步执行。
 
 **处理流程：**
 1. 验证请求者具有 ROOT 权限，或为本账户的 ADMIN
-2. 调用 API Key Manager 删除用户及其 API Key
-3. 返回删除确认
+2. 写入删除 fence，并使用户 API Key 失效
+3. 提交一个持久化清理任务，删除该用户拥有的数据
+4. 返回删除任务 ID
 
 **代码入口：**
 - `openviking/server/routers/admin.py:remove_user` - HTTP 路由
-- `openviking/server/api_keys/new.py:APIKeyManager.remove_user` - 核心实现
+- `openviking/service/user_deletion.py:UserDeletionService.delete_user` - 核心实现
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. 接口和参数说明
@@ -701,6 +801,7 @@ ov --sudo admin list-users acme
 **说明：**
 - ADMIN 只能移除自己所属的 account 中的用户
 - 不能删除账户的最后一个 admin 用户
+- 删除开始后，用户 key 立即失效，list_users 不再返回该用户
 
 #### 3. 使用示例
 
@@ -724,7 +825,7 @@ client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
 result = client.admin_remove_user("acme", "bob")
-print(f"User deleted: {result['deleted']}")
+print(f"User deletion task: {result['task_id']}")
 ```
 
 **TypeScript SDK**
@@ -740,7 +841,7 @@ result, err := client.AdminRemoveUser(ctx, "acme", "bob")
 if err != nil {
     return err
 }
-fmt.Println(result["deleted"])
+fmt.Println(result["task_id"])
 ```
 
 **CLI**
@@ -759,7 +860,10 @@ ov --sudo admin remove-user acme bob
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "account_id": "acme",
+    "user_id": "bob",
+    "status": "deleting",
+    "task_id": "..."
   },
   "time": 0.1
 }
@@ -820,7 +924,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_set_role("acme", "bob", "admin")
+result = client.admin_set_role(account_id="acme", user_id="bob", role="admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
 ```
 
@@ -918,7 +1022,11 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
+result = client.admin_regenerate_key(
+    account_id="acme",
+    user_id="bob",
+    seed="bob-new-seed",
+)
 print(f"New user key: {result['user_key']}")
 ```
 

@@ -6,7 +6,7 @@ The Content API reads L0/L1/L2 content, writes text, and maintains semantic and 
 
 ### abstract()
 
-Read L0 abstract (~100 tokens summary).
+Read the L0 abstract (an approximately 100-token summary), excluding the OKF header.
 
 **Parameters**
 
@@ -18,7 +18,7 @@ Read L0 abstract (~100 tokens summary).
 **Python SDK**
 
 ```python
-abstract = client.abstract("viking://resources/docs/")
+abstract = client.abstract(uri="viking://resources/docs/")
 print(f"Abstract: {abstract}")
 # Output: "Documentation for the project API, covering authentication, endpoints..."
 ```
@@ -72,7 +72,7 @@ openviking abstract viking://resources/docs/
 
 ### overview()
 
-Read L1 overview, applies to directories.
+Read the L1 overview for a directory, excluding the OKF header.
 
 **Parameters**
 
@@ -84,7 +84,7 @@ Read L1 overview, applies to directories.
 **Python SDK**
 
 ```python
-overview = client.overview("viking://resources/docs/")
+overview = client.overview(uri="viking://resources/docs/")
 print(f"Overview:\n{overview}")
 ```
 
@@ -137,7 +137,7 @@ openviking overview viking://resources/docs/
 
 ### read()
 
-Read L2 full content.
+Read the complete text of an L0, L1, or L2 file.
 
 **Parameters**
 
@@ -157,7 +157,7 @@ Read L2 full content.
 **Python SDK**
 
 ```python
-content = client.read("viking://resources/docs/api.md")
+content = client.read(uri="viking://resources/docs/api.md")
 print(f"Content:\n{content}")
 ```
 
@@ -210,23 +210,23 @@ openviking read viking://resources/docs/api.md
 
 ### write()
 
-Update an existing file, or create a new one when `mode="create"`, and automatically refresh related semantics and vectors.
+Write a file and automatically refresh related semantics and vectors.
 
 **Parameters**
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| uri | str | Yes | - | File URI to write. For `mode="create"`, the file must not already exist |
+| uri | str | Yes | - | File URI to write |
 | content | str | Yes | - | New content to write |
-| mode | str | No | `replace` | `replace`, `append`, or `create` |
+| mode | str | No | `replace` | `replace` overwrites an existing file or creates a missing file; `append` appends to an existing file or creates a missing file; `create` creates only a missing file and returns `409 Conflict` if it already exists |
 | wait | bool | No | `false` | Wait for background semantic/vector refresh |
 | timeout | float | No | `null` | Timeout in seconds when `wait=true` |
 
 **Notes**
 
-- `replace` and `append` require the file to exist; `create` targets a new file and returns `409 Conflict` when the path already exists. Directories are always rejected.
-- `create` only accepts text-writable extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, `.ts`. Parent directories are created automatically.
-- Derived semantic files cannot be written directly: `.abstract.md`, `.overview.md`, `.relations.json`.
+- `replace` and `append` create a missing target file. `append` uses the supplied content as the initial file content in that case. `create` targets only a missing file and returns `409 Conflict` when the path already exists. Directories are always rejected.
+- Explicit `create` only accepts text-writable extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, `.ts`. Parent directories are created automatically for every write mode.
+- Existing `.abstract.md` and `.overview.md` bodies may be updated, but public APIs cannot create them. A body-only request preserves stored OKF metadata; a full-OKF request must match the stored metadata. Unknown metadata fields are silently dropped. A sidecar body write rebuilds only the directory's existing L0/L1 vectors and does not regenerate semantics.
 - File content is updated before the API returns. `wait` only controls whether the call waits for semantic/vector refresh to finish.
 - The public API no longer accepts `regenerate_semantics` or `revectorize`; write always refreshes related semantics and vectors.
 
@@ -235,8 +235,8 @@ Update an existing file, or create a new one when `mode="create"`, and automatic
 
 ```python
 result = client.write(
-    "viking://resources/docs/api.md",
-    "# Updated API\n\nFresh content.",
+    uri="viking://resources/docs/api.md",
+    content="# Updated API\n\nFresh content.",
     mode="replace",
     wait=True,
 )
@@ -328,7 +328,7 @@ openviking write viking://resources/docs/api.md \
 
 ### batch_write()
 
-Apply a preconditioned set of file writes below one Resource or Memory directory, then refresh the affected semantic and vector indexes as one request.
+Write multiple files below one Resource or Memory directory, then refresh the affected semantic and vector indexes once after all writes finish.
 
 **Parameters**
 
@@ -347,17 +347,18 @@ Each operation contains:
 | `uri` | string | Yes | Target file URI below `root_uri` |
 | `content` | string | Conditional | UTF-8 text; exactly one of `content` and `content_base64` is required |
 | `content_base64` | string | Conditional | Base64-encoded bytes; not supported for Memory targets |
-| `precondition.kind` | string | Yes | `create_if_absent` or `replace_if_hash` |
-| `precondition.base_hash` | string | Conditional | Required for `replace_if_hash`, formatted as `sha256:<lowercase-hex>` |
+| `mode` | string | No | `replace` (default), `append`, `create`, or `upsert` |
 
 **Notes**
 
-- A request supports at most 128 operations, 8 MiB per file, and 16 MiB total.
+- A request supports at most 256 operations, 8 MiB per file, and 16 MiB total.
 - All targets must be files below `root_uri`, use the same context type, and have unique canonical URIs.
 - Resource targets may use any safe file extension; Memory targets retain the text extension allowlist and do not accept binary content.
-- Every non-idempotent precondition is checked under the target tree lock before the first new write. A mismatch returns `409 Conflict`.
-- If a target already contains the requested bytes, it is reported as `unchanged`; retrying the same request can therefore repeat a failed refresh without rewriting matching content.
-- The API prevents precondition conflicts from causing new writes, but an underlying I/O failure can still leave writes completed earlier in the batch visible.
+- `replace`, `append`, and `create` match `write()` semantics. `upsert` replaces an existing file or creates a missing file.
+- The batch holds one target tree lock while writing. Semantic processing starts only after every file is written and the lock is released, so `.overview.md` and `.abstract.md` are refreshed once for the batch.
+- An underlying I/O failure can still leave writes completed earlier in the batch visible.
+- Existing `.abstract.md` and `.overview.md` bodies may be replaced or appended. OpenViking preserves and validates protected OKF metadata and rebuilds only the directory's existing L0/L1 vectors for these operations.
+- In the response body, `semantic_status` (`queued`, `complete`, or `deferred`) reports the directory aggregation status, while `vector_status` reports vector maintenance for changed files.
 
 **Python SDK**
 
@@ -368,15 +369,12 @@ result = client.batch_write(
         {
             "uri": "viking://resources/wiki/new.md",
             "content": "# New page\n",
-            "precondition": {"kind": "create_if_absent"},
+            "mode": "upsert",
         },
         {
             "uri": "viking://resources/wiki/existing.md",
             "content": "# Updated page\n",
-            "precondition": {
-                "kind": "replace_if_hash",
-                "base_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            },
+            "mode": "upsert",
         },
     ],
     wait=True,
@@ -399,7 +397,7 @@ curl -X POST http://localhost:1933/api/v1/content/batch-write \
       {
         "uri": "viking://resources/wiki/new.md",
         "content": "# New page\n",
-        "precondition": {"kind": "create_if_absent"}
+        "mode": "upsert"
       }
     ],
     "wait": true
@@ -416,6 +414,8 @@ curl -X POST http://localhost:1933/api/v1/content/batch-write \
     "created": ["viking://resources/wiki/new.md"],
     "updated": [],
     "unchanged": [],
+    "semantic_status": "complete",
+    "vector_status": "complete",
     "queue_status": {
       "Semantic": {
         "processed": 1,
@@ -452,6 +452,12 @@ curl --get http://localhost:1933/api/v1/content/download \
   --output logo.png
 ```
 
+**CLI**
+
+```bash
+ov get viking://resources/images/logo.png ./logo.png
+```
+
 **Response**
 
 On success, the endpoint returns HTTP `200` with the raw file bytes instead of the standard JSON envelope:
@@ -464,7 +470,7 @@ Content-Disposition: attachment; filename*=UTF-8''logo.png
 <binary body>
 ```
 
-The public SDKs and CLI do not currently expose a dedicated raw-byte download method, so this section shows only the HTTP tab.
+`ov get <uri> <local-path>` downloads through the HTTP API above and writes the file to a local path. The Python, TypeScript, and Go SDKs do not currently expose a dedicated raw-byte download method.
 
 ---
 
@@ -476,8 +482,8 @@ Set explicit `k=v` tags used by retrieval filters. `replace` replaces existing t
 
 ```python
 result = client.set_tags(
-    "viking://resources/project/",
-    ["team=search", "env=prod"],
+    uri="viking://resources/project/",
+    tags=["team=search", "env=prod"],
     mode="replace",
     recursive=True,
 )
@@ -572,7 +578,6 @@ This API operates on existing `viking://...` content. It does not import new fil
 **Authentication**
 
 - HTTP endpoint: requires admin/root role when authentication is enabled. In `api_key` mode, use an admin key for tenant content; a raw root key cannot access tenant-scoped data.
-- Python embedded mode: uses the current service context
 - Python HTTP client / CLI: sends the current authenticated identity
 
 **Parameters**
@@ -583,6 +588,9 @@ This API operates on existing `viking://...` content. It does not import new fil
 | mode | str | No | `vectors_only` | Reindex mode: `vectors_only`, `semantic_and_vectors`, or `prune_orphans` |
 | wait | bool | No | `true` | Whether to wait for completion |
 | dry_run | bool | No | `false` | Only valid with `mode="prune_orphans"`; report orphan vector records without deleting them |
+| recursive | bool | No | `true` | Whether to process descendants recursively; `false` applies only to `semantic_and_vectors` on a `resource`, `memory`, or `skill` directory |
+| tags | list[str] | No | `null` | Write tags to every successfully rebuilt vector record. Omit to preserve existing tags; an empty list with `replace` clears them |
+| tag_mode | str | No | `replace` | Tag write mode: `replace` or `append` |
 
 The HTTP request body rejects unknown fields. `uri` may use OpenViking path variables accepted by other content APIs; it is resolved before validation.
 
@@ -611,7 +619,13 @@ For `resource` and `skill`, `semantic_and_vectors` refreshes directory/file sema
 
 For `semantic_and_vectors`, semantic generation and vector rebuilding are sequenced by the reindex executor. The semantic refresh step does not enqueue its own background vectorization work; vectors are rebuilt by the reindex step so `wait=true` reflects the reindex operation itself.
 
+For a `resource` or `memory` directory, `recursive=false` regenerates only the target directory's `.abstract.md` and `.overview.md`, then rebuilds only that directory's L0/L1 vectors. Child directories do not regenerate semantic artifacts, and neither child directories nor files are re-vectorized. The target aggregation still reads existing summaries from deterministically sampled child directories; sampled direct files are summarized as inputs to the target aggregation. For a `skill` target, `recursive=false` regenerates the skill directory's L0/L1 semantic artifacts and vectors from `SKILL.md`, but does not rebuild the `SKILL.md` L2 vector. This flag does not change existing behavior for `vectors_only`, `prune_orphans`, or namespace targets.
+
 For `prune_orphans`, source existence is checked against the filesystem. If an entire directory is missing, vector records for files and semantic sidecars below that directory, such as `.abstract.md` and `.overview.md`, are pruned together. `dry_run` is rejected for other modes.
+
+When `tags` is provided, tags are included in the same upsert as each vector record produced by reindex; reindex does not call `set_tags` afterwards. Directory and namespace reindex operations apply tags to successfully rebuilt directory L0/L1 and leaf L2 records. `replace` overwrites existing tags, while `append` merges by key. When `tags` is omitted, `tag_mode` is ignored and existing tags remain unchanged. `prune_orphans` produces no vectors and ignores both fields.
+
+Subtree reindex is not transactional. Records skipped because no semantic source is available, or records whose embedding fails, do not receive the new tags.
 
 **Python SDK**
 
@@ -620,6 +634,10 @@ result = client.reindex(
     uri="viking://resources",
     mode="vectors_only",
     wait=True,
+    options={
+        "tags": ["team=search", "env=prod"],
+        "tag_mode": "replace",
+    },
 )
 print(result)
 ```
@@ -645,15 +663,23 @@ print(result["would_delete_records"])
 **TypeScript SDK**
 
 ```typescript
-console.log(await client.reindex("viking://resources/docs/"));
+console.log(await client.reindex("viking://resources/docs/", {
+  tags: ["team=search"],
+  tagMode: "append",
+}));
 ```
 
 **Go SDK**
+
+When passing a non-`nil` `ReindexOptions`, set `Wait` explicitly. Go's zero
+value is `false`; only `opts=nil` applies the SDK default `wait=true`.
 
 ```go
 result, err := client.Reindex(ctx, "viking://resources", &openviking.ReindexOptions{
     Mode: "vectors_only",
     Wait: true,
+    Tags: []string{"team=search"},
+    TagMode: "replace",
 })
 if err != nil {
     return err
@@ -688,17 +714,21 @@ curl -X POST http://localhost:1933/api/v1/content/reindex \
   -H "X-OpenViking-Account: default" \
   -d '{
     "uri": "viking://resources",
-    "mode": "prune_orphans",
+    "mode": "vectors_only",
     "wait": true,
-    "dry_run": true
+    "tags": ["team=search", "env=prod"],
+    "tag_mode": "replace"
   }'
 ```
 
 **CLI**
 
 ```bash
-openviking reindex viking://resources --mode vectors_only
+openviking reindex viking://resources --mode vectors_only \
+  --tag team=search --tag env=prod --tag-mode replace
 ```
+
+The CLI sends tag fields only when at least one `--tag` is provided. Use HTTP or an SDK to clear tags with `tags: []`.
 
 ```bash
 openviking reindex viking://user/default/skills --mode semantic_and_vectors --wait false

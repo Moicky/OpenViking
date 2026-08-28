@@ -2,6 +2,10 @@
 
 Long-term semantic memory and context takeover for [pi](https://github.com/earendil-works/pi) sessions, powered by [OpenViking](https://github.com/volcengine/OpenViking). Recall happens automatically before every prompt, capture happens after every turn, and OpenViking can own long-term context by replacing committed history with an archive overview in pi's `context` hook.
 
+> **Requires an OpenViking server with `viking://~` home-alias support.** Recall targets the
+> caller's own context space through `viking://~/memories` and `viking://~/skills`; the uid-less
+> `viking://user/memories` shorthand is rejected by newer servers.
+
 > Design informed by lessons from all three OpenViking agent plugins: synchronous recall from OpenClaw, production-hardened capture/ranking from Claude Code, and anti-patterns dodged from Hermes's stale prefetch approach. See [DESIGN.md](./DESIGN.md) for the base design and [TAKEOVER.md](./TAKEOVER.md) for the context-takeover layer.
 
 ## Quick Start
@@ -75,6 +79,12 @@ Credential environment variables:
 | `OPENVIKING_WORKSPACE_PEER` | Derive an actor peer from the current workspace by default; set `0` to disable |
 | `OPENVIKING_RECALL_PEER_SCOPE` | `all` recalls other project memories with a score penalty; `actor` only sees global plus the current project |
 
+Recall asks the server to assemble the context block in one request
+(`POST /api/v1/search/search` with `mode="context"`), so token budgeting, detail
+tiers and cross-turn dedup are shared with every other harness. Deployments
+without that endpoint fall back to `/api/v1/search/recall`, and that outcome is
+cached so only the first turn pays for the probe.
+
 API keys are sent as `Authorization: Bearer ...`. By default the extension derives a peer from the process workspace path using Claude's project-directory naming rule: every non-letter-or-digit character becomes `-`, with no path normalization. For example, `/Users/x/Dev/OpenViking` becomes `-Users-x-Dev-OpenViking`. The effective peer is sent as `X-OpenViking-Actor-Peer` and stored as `peer_id` on captured session messages. `OPENVIKING_PEER_ID` overrides the workspace-derived value.
 
 Recall defaults to the broad mode: global memory, the current workspace, and other workspace memories can all be recalled, with other workspaces penalized and rendered later. Set `OPENVIKING_RECALL_PEER_SCOPE=actor` for the isolation mode, which only sees global memory plus the current workspace. In deployments where one bot serves multiple real people, such as zouk, vikingbot, or AstrBot, use the isolation mode with an explicit actor peer so one person's memories are not recalled into another person's session.
@@ -105,9 +115,31 @@ All fields below live in `config.json`. Defaults are shown.
 | `recallTokenBudget`      | `2000`     | Token budget for inline recall content                                   |
 | `recallMaxContentChars`  | `500`      | Per-item content cap for search results                                  |
 | `recallPreferAbstract`   | `true`     | Prefer L0 abstract over L2 full body when available                      |
-| `recallLimit`            | `6`        | Max memories to inject per prompt                                        |
+| `recallLimit`            | `10`       | Legacy quota-scaling input converted to six coding quotas, not a final cap |
 | `scoreThreshold`         | `0.35`     | Min relevance score (0–1)                                                |
 | `minQueryLength`         | `3`        | Skip recall for queries shorter than N characters                        |
+| `recallLedger`           | `true`     | Persist injected blocks and re-apply them to historical user messages so provider prompt-prefix caches keep hitting |
+
+### Recall injection ledger
+
+Pi's `context` hook hands extensions a deep copy of the session messages, so
+an injected `<openviking-context>` block is never written back to session
+storage. Without compensation, every request's history diverges from what the
+provider saw last turn, and strict-prefix prompt caches (DeepSeek and other
+OpenAI-compatible providers) miss from the first injected message onward
+(#4137). The ledger records exactly which block was injected into which user
+message (keyed by stable Pi entry id + content hash) in
+`~/.openviking/pi-recall-ledger/<session>.json` and re-applies them on every
+request, keeping the prefix byte-identical across turns while the newest
+message still gets fresh, current-query recall. Disable with
+`"recallLedger": false` or `OPENVIKING_RECALL_LEDGER=0`. Losing the ledger
+file only costs one cache miss; alignment resumes on the next turn. Stable
+entry ids let compacted retained messages and `/tree` branches recover their
+own original blocks even when active-context positions change.
+
+Explicit `recallLimit` values from 1 through 5 produce an effective total
+quota of 6 because each coding category keeps one retrieval slot. Direct API
+integrations should configure category `quotas` when they need exact ceilings.
 
 ### Capture tuning
 
@@ -117,7 +149,7 @@ All fields below live in `config.json`. Defaults are shown.
 | `captureMaxLength`       | `24000`    | Max sanitized text length for the capture decision                       |
 | `captureAssistantTurns`  | `true`     | Include assistant turns (text + tool USE inputs)                         |
 | `captureToolResults`     | `false`    | Include tool result output (noisy — off by default)                      |
-| `captureToolMaxChars`    | `2000`     | Max captured output chars for one tool part                              |
+| `captureToolMaxChars`    | `1000000`  | Guard cap on one tool part's `tool_output`; the server externalizes oversized output |
 | `commitTokenThreshold`   | `20000`    | Pending-token threshold for client-driven commit                         |
 | `commitKeepRecentCount`  | `10`       | Live tail kept after commit                                              |
 

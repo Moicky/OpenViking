@@ -137,7 +137,10 @@ test("auto-capture commits when pending tokens cross threshold", async () => {
       }
       if (req.method === "POST" && url.pathname === "/api/v1/sessions/cx-codex_commit/commit") {
         calls[calls.length - 1].body = await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { archived: true, task_id: "task-1" } });
+        writeJson(res, {
+          status: "ok",
+          result: { archived: true, task_id: "task-1", trace_id: "trace-codex-commit" },
+        });
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -165,12 +168,14 @@ test("auto-capture commits when pending tokens cross threshold", async () => {
 
       const output = JSON.parse(result.stdout.trim());
       assert.ok(output && typeof output === "object");
+      assert.match(output.systemMessage, /trace_id=trace-codex-commit/);
     });
 
     const commitCall = calls.find((call) => call.path.endsWith("/commit"));
     const debugLog = await readFile(debugLogPath, "utf-8").catch(() => "");
     assert.ok(commitCall, `expected threshold commit call; calls=${JSON.stringify(calls)} debug=${debugLog}`);
     assert.deepEqual(commitCall.body, { keep_recent_count: 7 });
+    assert.match(debugLog, /"trace_id":"trace-codex-commit"/);
 
     const batchCall = calls.find((call) => call.path.endsWith("/messages/batch"));
     assert.ok(batchCall, `expected batch add-message call; calls=${JSON.stringify(calls)}`);
@@ -296,6 +301,163 @@ test("auto-capture sends every new turn when one response exceeds the old limit"
       calls.flatMap((body) => body.messages || []).length,
       22,
       "every normalized text/tool turn must be sent",
+    );
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("auto-capture logs a commit error trace_id", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-auto-capture-error-"));
+  const transcriptPath = join(stateDir, "transcript.jsonl");
+  const debugLogPath = join(stateDir, "debug.log");
+
+  try {
+    await writeFile(
+      transcriptPath,
+      JSON.stringify({
+        payload: {
+          message: {
+            role: "user",
+            content: "remember this failed commit trace",
+          },
+        },
+      }),
+    );
+
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { ok: true } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
+        await readRequestBody(req);
+        writeJson(res, { status: "ok", result: { ok: true } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-codex_error") {
+        writeJson(res, {
+          status: "ok",
+          result: { pending_tokens: 2500, commit_count: 0, total_message_count: 1 },
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/commit")) {
+        await readRequestBody(req);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "error",
+          error: {
+            code: "INTERNAL",
+            message: "commit failed",
+            trace_id: "trace-codex-error",
+          },
+        }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "error", error: "not found" }));
+    }, async (baseUrl) => {
+      await runAutoCapture(
+        { session_id: "codex:error", transcript_path: transcriptPath },
+        {
+          OPENVIKING_AUTO_CAPTURE: "1",
+          OPENVIKING_CODEX_STATE_DIR: stateDir,
+          OPENVIKING_DEBUG: "1",
+          OPENVIKING_DEBUG_LOG: debugLogPath,
+          OPENVIKING_CONFIG_FILE: join(stateDir, "missing-ov.conf"),
+          OPENVIKING_CLI_CONFIG_FILE: join(stateDir, "missing-ovcli.conf"),
+          OPENVIKING_CREDENTIAL_SOURCE: "env",
+          OPENVIKING_COMMIT_TOKEN_THRESHOLD: "1000",
+          OPENVIKING_MIN_QUERY_LENGTH: "1",
+          OPENVIKING_WRITE_PATH_ASYNC: "0",
+          OPENVIKING_TIMEOUT_MS: "5000",
+          OPENVIKING_URL: baseUrl,
+        },
+      );
+    });
+
+    const debugLog = await readFile(debugLogPath, "utf-8");
+    assert.match(debugLog, /"trace_id":"trace-codex-error"/);
+    assert.match(debugLog, /"error":"commit failed"/);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("auto-capture skips compacted history after transcript shrink", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-auto-capture-compact-"));
+  const transcriptPath = join(stateDir, "transcript.jsonl");
+  const batches = [];
+  const now = Date.now();
+
+  try {
+    await writeFile(join(stateDir, "compaction.json"), JSON.stringify({
+      codexSessionId: "compaction",
+      ovSessionId: "cx-compaction",
+      capturedTurnCount: 8,
+      createdAt: now - 1000,
+      lastUpdatedAt: now,
+    }));
+    await writeFile(
+      transcriptPath,
+      [
+        { payload: { message: { role: "user", content: "compacted historical summary" } } },
+        { payload: { message: { role: "assistant", content: "prior assistant tail" } } },
+        { payload: { message: { role: "user", content: "current user request" } } },
+        { payload: { type: "function_call", id: "call-1", name: "shell", arguments: "{}" } },
+        { payload: { type: "function_call_output", call_id: "call-1", output: "tool result" } },
+        { payload: { message: { role: "assistant", content: "current assistant response" } } },
+      ].map((entry) => JSON.stringify(entry)).join("\n"),
+    );
+
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { ok: true } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
+        batches.push(await readRequestBody(req));
+        writeJson(res, { status: "ok", result: { ok: true } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-compaction") {
+        writeJson(res, {
+          status: "ok",
+          result: { pending_tokens: 0, commit_count: 0, total_message_count: 4 },
+        });
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "error", error: "not found" }));
+    }, async (baseUrl) => {
+      await runAutoCapture(
+        { session_id: "compaction", transcript_path: transcriptPath },
+        {
+          OPENVIKING_AUTO_CAPTURE: "1",
+          OPENVIKING_CAPTURE_ASSISTANT_TURNS: "1",
+          OPENVIKING_CODEX_STATE_DIR: stateDir,
+          OPENVIKING_CONFIG_FILE: join(stateDir, "missing-ov.conf"),
+          OPENVIKING_CLI_CONFIG_FILE: join(stateDir, "missing-ovcli.conf"),
+          OPENVIKING_CREDENTIAL_SOURCE: "env",
+          OPENVIKING_MIN_QUERY_LENGTH: "1",
+          OPENVIKING_WRITE_PATH_ASYNC: "0",
+          OPENVIKING_TIMEOUT_MS: "5000",
+          OPENVIKING_URL: baseUrl,
+        },
+      );
+    });
+
+    const messages = batches.flatMap((batch) => batch.messages || []);
+    assert.equal(messages.length, 4);
+    assert.equal(messages[0].parts[0].text, "current user request");
+    assert.equal(
+      messages.some((message) =>
+        message.parts?.some((part) => part.text === "compacted historical summary")
+      ),
+      false,
     );
   } finally {
     await rm(stateDir, { recursive: true, force: true });

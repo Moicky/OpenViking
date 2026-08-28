@@ -173,17 +173,17 @@ OpenViking 需要以下模型服务：
 ### 测试连接
 
 ```python
-import openviking as ov
 import asyncio
+from openviking_sdk import AsyncHTTPClient
 
 async def test():
-    client = ov.AsyncOpenViking(path="./test_data")
+    client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
     await client.initialize()
 
     # 添加简单资源测试
     result = await client.add_resource(
-        "https://example.com",
-        reason="测试连接"
+        path="https://example.com",
+        options={"reason": "测试连接"},
     )
     print(f"✓ 配置成功: {result['root_uri']}")
 

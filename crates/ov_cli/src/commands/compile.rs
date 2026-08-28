@@ -14,19 +14,22 @@ pub async fn run(
     reason: Option<String>,
     wait: bool,
     timeout: Option<f64>,
+    runtime_timeout: Option<f64>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
     let sources = normalize_sources(from_uris)?;
-    if timeout.is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0) {
-        return Err(Error::Client("--timeout must be a positive number".into()));
+    if timeout.is_some_and(|seconds| !crate::config::timeout_is_valid(seconds)) {
+        return Err(Error::Client(
+            "--timeout must be a positive finite number of seconds".into(),
+        ));
     }
     let reason = reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let accepted = client
-        .create_compile(&sources, to.trim(), skill.trim(), reason)
+        .create_compile(&sources, to.trim(), skill.trim(), reason, runtime_timeout)
         .await?;
     if !wait {
         render_accepted(&accepted, output_format, compact);
@@ -58,6 +61,14 @@ pub async fn run(
                     error.message,
                     None,
                     500,
+                ));
+            }
+            "cancelled" => {
+                return Err(Error::api_response(
+                    Some("CANCELLED".into()),
+                    format!("Compile task {} was cancelled", accepted.task_id),
+                    None,
+                    409,
                 ));
             }
             _ => {}

@@ -94,7 +94,7 @@ impl CliContext {
 
     pub fn get_client_with_timeout(&self, timeout_secs: Option<f64>) -> client::HttpClient {
         let auth = self.config.effective_auth(self.sudo);
-        client::HttpClient::new(
+        let mut client = client::HttpClient::new(
             &self.config.url,
             auth.api_key,
             auth.account,
@@ -104,7 +104,34 @@ impl CliContext {
             self.profile.unwrap_or(self.config.profile),
             self.config.effective_extra_headers(),
         )
-        .with_gateway_token(self.config.effective_gateway_token())
+        .with_gateway_token(self.config.effective_gateway_token());
+
+        // Add LDAP or OIDC authentication if configured
+        if let Some(auth_mode) = &self.config.auth_mode {
+            match auth_mode.as_str() {
+                "ldap" => {
+                    client = client.with_auth_mode(Some("ldap".to_string()));
+                    if let Some(ldap_username) = &self.config.ldap_username {
+                        client = client.with_ldap_username(Some(ldap_username.clone()));
+                    }
+                    if let Some(ldap_password) = &self.config.ldap_password {
+                        client = client.with_ldap_password(Some(ldap_password.clone()));
+                    }
+                }
+                "oidc" => {
+                    client = client.with_auth_mode(Some("oidc".to_string()));
+                    if let Some(token) = &self.config.oidc_token {
+                        client = client.with_oidc_token(Some(token.clone()));
+                    } else if let Some(api_key) = &self.config.api_key {
+                        // Fallback: use api_key as OIDC token if it looks like a JWT
+                        client = client.with_oidc_token(Some(api_key.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        client
     }
 }
 
@@ -119,12 +146,11 @@ struct Cli {
         short,
         long,
         value_enum,
-        default_value = "table",
         global = true,
         hide = true,
         value_name = "table|json"
     )]
-    output: OutputFormat,
+    output: Option<OutputFormat>,
 
     /// Use compact table/JSON rendering
     #[arg(
@@ -287,48 +313,25 @@ enum Commands {
             conflicts_with = "manifest"
         )]
         path: Option<String>,
-        /// Apply an OpenViking Assets manifest (openviking-assets/1): create or sync every selected asset
+        /// Apply an OpenViking Assets manifest (openviking-assets/1): create or sync every selected
+        /// asset. Run options go into --args (supported keys: catalog, dry_run, skip_failed)
         #[arg(
             short = 'm',
             long = "manifest",
             value_name = "file",
-            help_heading = "Manifest mode",
+            help_heading = "Common options",
             conflicts_with_all = [
-                "add_type", "to", "parent", "parent_auto_create", "resource_args",
+                "add_type", "to", "parent", "parent_auto_create",
                 "strict_mode", "ignore_dirs", "include", "exclude",
-                "no_directly_upload_media", "tags", "tag_mode"
+                "no_directly_upload_media", "tags", "tag_mode",
+                "reason", "instruction"
             ]
         )]
         manifest: Option<String>,
-        /// Manifest mode: separate catalog file for manifests that select assets by name
-        /// (defaults to assets.yaml next to the manifest; not used when the manifest
-        /// defines assets under 'catalog')
-        #[arg(
-            long = "catalog",
-            value_name = "file",
-            requires = "manifest",
-            conflicts_with = "path",
-            help_heading = "Manifest mode"
-        )]
-        catalog: Option<String>,
-        /// Manifest mode: validate config and source access, then print the plan without submitting
-        #[arg(
-            long = "dry-run",
-            requires = "manifest",
-            help_heading = "Manifest mode"
-        )]
-        dry_run: bool,
-        /// Manifest mode: continue with remaining assets when one fails
-        #[arg(
-            long = "skip-failed",
-            requires = "manifest",
-            help_heading = "Manifest mode"
-        )]
-        skip_failed: bool,
         /// Explicit Connector source type (e.g. "tos", "git"). Routes the import
         /// through the Connector integration (must be enabled server-side); the
         /// path is sent verbatim and never treated as a local file. Requires --to
-        /// and cannot be combined with Manifest mode, --parent, or
+        /// and cannot be combined with --manifest, --parent, or
         /// --parent-auto-create
         #[arg(
             long = "add-type",
@@ -371,8 +374,13 @@ enum Commands {
         /// Wait until processing is complete
         #[arg(long, help_heading = "Common options")]
         wait: bool,
-        /// Wait timeout in seconds (only used with --wait)
-        #[arg(long, value_name = "seconds", help_heading = "Common options")]
+        /// Request timeout in seconds. Used with --wait and by Manifest private Git imports
+        #[arg(
+            long,
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds",
+            help_heading = "Common options"
+        )]
         timeout: Option<f64>,
         /// Enable strict mode for directory scanning (fail if any unsupported files found)
         #[arg(
@@ -408,7 +416,10 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         processing_mode: String,
-        /// Parser-specific import options, e.g. --args feishu_access_token:u-xxx
+        /// Extra options as key:value pairs or a JSON object. With a path/URL:
+        /// parser-specific import options sent to the server, e.g.
+        /// --args feishu_access_token:u-xxx. With --manifest: run options consumed
+        /// locally, e.g. --args dry_run:true (supported keys: catalog, dry_run, skip_failed)
         #[arg(long = "args")]
         resource_args: Option<String>,
         /// Explicit k=v retrieval tag to apply after import. Can be repeated.
@@ -434,7 +445,12 @@ enum Commands {
         #[arg(long, help_heading = "Common options")]
         wait: bool,
         /// Wait timeout in seconds
-        #[arg(long, value_name = "seconds", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds",
+            help_heading = "Common options"
+        )]
         timeout: Option<f64>,
         /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
         #[arg(
@@ -482,6 +498,7 @@ enum Commands {
             short = 'n',
             alias = "limit",
             default_value = "256",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -510,6 +527,7 @@ enum Commands {
             short = 'n',
             alias = "limit",
             default_value = "256",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -546,7 +564,12 @@ enum Commands {
         #[arg(long, help_heading = "Common options")]
         wait: bool,
         /// Wait timeout in seconds (only used with --wait)
-        #[arg(long, value_name = "seconds", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds",
+            help_heading = "Common options"
+        )]
         timeout: Option<f64>,
     },
     /// [Data] Move or rename resource
@@ -623,8 +646,21 @@ enum Commands {
         /// Wait for async processing to finish
         #[arg(long, default_value = "false", help_heading = "Common options")]
         wait: bool,
+        /// Content post-write processing mode
+        #[arg(
+            long = "processing-mode",
+            default_value = "semantic_and_vectors",
+            value_parser = ["semantic_and_vectors", "vectors_only"],
+            help_heading = "Advanced options"
+        )]
+        processing_mode: String,
         /// Optional wait timeout in seconds
-        #[arg(long, value_name = "seconds", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds",
+            help_heading = "Common options"
+        )]
         timeout: Option<f64>,
     },
     /// [Data] Update explicit retrieval tags metadata for a file or directory
@@ -678,6 +714,7 @@ enum Commands {
             long = "node-limit",
             alias = "limit",
             default_value = "10",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -715,6 +752,9 @@ enum Commands {
         /// Only include results matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Include the full visible content for every matched URI
+        #[arg(long, help_heading = "Advanced options")]
+        read_content: bool,
     },
     /// [Experimental][Data] Run context-aware retrieval
     Search {
@@ -746,6 +786,7 @@ enum Commands {
             long = "node-limit",
             alias = "limit",
             default_value = "10",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -783,6 +824,9 @@ enum Commands {
         /// Only include results matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Include the full visible content for every matched URI
+        #[arg(long, help_heading = "Advanced options")]
+        read_content: bool,
     },
     /// [Data] Run content pattern search
     Grep {
@@ -815,6 +859,7 @@ enum Commands {
             long = "node-limit",
             alias = "limit",
             default_value = "256",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -849,6 +894,7 @@ enum Commands {
             long = "node-limit",
             alias = "limit",
             default_value = "256",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
@@ -871,38 +917,6 @@ enum Commands {
     Privacy {
         #[command(subcommand)]
         action: PrivacyCommands,
-    },
-    /// [Experimental][Data] List relations of a resource
-    Relations {
-        /// Viking URI
-        #[arg(value_name = "uri")]
-        uri: String,
-    },
-    /// [Experimental][Data] Create relation links from one URI to one or more targets
-    Link {
-        /// Source URI
-        #[arg(value_name = "from-uri")]
-        from_uri: String,
-        /// One or more target URIs
-        #[arg(value_name = "to-uri")]
-        to_uris: Vec<String>,
-        /// Reason for linking
-        #[arg(
-            long,
-            default_value = "",
-            value_name = "text",
-            help_heading = "Common options"
-        )]
-        reason: String,
-    },
-    /// [Experimental][Data] Remove a relation link
-    Unlink {
-        /// Source URI
-        #[arg(value_name = "from-uri")]
-        from_uri: String,
-        /// Target URI to unlink
-        #[arg(value_name = "to-uri")]
-        to_uri: String,
     },
     /// [Data] Export context as .ovpack
     Export {
@@ -1012,7 +1026,7 @@ enum Commands {
     },
     /// [Interactive] Compile source materials with a VikingBot Skill
     Compile {
-        /// Source directory; repeat the flag or separate directories with commas
+        /// Source file or directory; repeat the flag or separate entries with commas
         #[arg(
             long = "from",
             required = true,
@@ -1033,15 +1047,32 @@ enum Commands {
         #[arg(long)]
         wait: bool,
         /// Local wait timeout in seconds; does not cancel the task
-        #[arg(long, requires = "wait", value_name = "seconds")]
+        #[arg(
+            long,
+            requires = "wait",
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds"
+        )]
         timeout: Option<f64>,
+        /// Server-side runtime limit in seconds; reaching it saves partial resource output
+        #[arg(
+            long = "runtime-timeout",
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds"
+        )]
+        runtime_timeout: Option<f64>,
     },
 
     // --- Status & Observability ---
     /// [Status] Wait for queued async processing to complete
     Wait {
         /// Wait timeout in seconds
-        #[arg(long, value_name = "seconds", help_heading = "Common options")]
+        #[arg(
+            long,
+            value_parser = config::parse_positive_timeout,
+            value_name = "seconds",
+            help_heading = "Common options"
+        )]
         timeout: Option<f64>,
     },
     /// [Status] Track async resource processing tasks
@@ -1119,6 +1150,26 @@ enum Commands {
         /// Preview prune_orphans deletions without mutating vectors
         #[arg(long, help_heading = "Common options")]
         dry_run: bool,
+        /// Explicit k=v retrieval tag for rebuilt vector records. Can be repeated.
+        #[arg(long = "tag", value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
+        /// Tag update mode when --tag is provided
+        #[arg(
+            long = "tag-mode",
+            default_value = "replace",
+            value_parser = ["replace", "append"],
+            help_heading = "Common options"
+        )]
+        tag_mode: String,
+        /// Recursively reindex subdirectories (only affects semantic_and_vectors)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_name = "bool",
+            help_heading = "Common options"
+        )]
+        recursive: bool,
     },
 }
 
@@ -1157,13 +1208,13 @@ fn legacy_upload_option_error(
 enum TaskCommands {
     /// Show status of a specific task
     Status {
-        /// Task ID returned by add-resource/add-skill
+        /// Task ID returned by an asynchronous command, including compile
         #[arg(value_name = "task-id")]
         task_id: String,
     },
     /// Cancel a task
     Cancel {
-        /// Task ID returned by add-resource/add-skill
+        /// Task ID returned by an asynchronous command, including compile
         #[arg(value_name = "task-id")]
         task_id: String,
     },
@@ -1267,7 +1318,7 @@ enum SystemCommands {
     /// Wait for queued async processing to complete
     Wait {
         /// Wait timeout in seconds
-        #[arg(long, value_name = "seconds")]
+        #[arg(long, value_parser = config::parse_positive_timeout, value_name = "seconds")]
         timeout: Option<f64>,
     },
     /// Show component status
@@ -1321,6 +1372,7 @@ enum ObserverCommands {
     /// Get retrieval quality metrics
     Retrieval,
     /// Get filesystem operation metrics
+    #[command(alias = "fs")]
     Filesystem,
     /// Get overall system status
     System,
@@ -1329,7 +1381,24 @@ enum ObserverCommands {
 #[derive(Subcommand)]
 enum SessionCommands {
     /// Create a new session
-    New,
+    New {
+        /// Optional session ID
+        #[arg(long = "session-id", value_name = "session-id")]
+        session_id: Option<String>,
+        /// Default event-memory tags as comma-separated key=value pairs
+        #[arg(long = "event-tags", value_name = "key=value", value_delimiter = ',')]
+        event_tags: Vec<String>,
+        /// Auto-commit policy as a JSON object
+        #[arg(
+            long = "auto-commit-policy-json",
+            value_name = "json",
+            conflicts_with = "no_auto_commit"
+        )]
+        auto_commit_policy_json: Option<String>,
+        /// Disable automatic commits for this session
+        #[arg(long = "no-auto-commit", conflicts_with = "auto_commit_policy_json")]
+        no_auto_commit: bool,
+    },
     /// List sessions
     List,
     /// Get session details
@@ -1386,11 +1455,80 @@ enum SessionCommands {
         #[arg(value_name = "messages-json")]
         messages: String,
     },
+    /// Update mutable session configuration
+    Config {
+        #[command(subcommand)]
+        action: SessionConfigCommands,
+    },
     /// Commit a session (archive messages and extract memories)
     Commit {
         /// Session ID
         #[arg(value_name = "session-id")]
         session_id: String,
+        /// Event-memory tags for this commit as comma-separated key=value pairs
+        #[arg(
+            long = "event-tags",
+            value_name = "key=value",
+            value_delimiter = ',',
+            conflicts_with = "no_event_tags"
+        )]
+        event_tags: Vec<String>,
+        /// Do not apply the session's default event tags to this commit
+        #[arg(long = "no-event-tags", conflicts_with = "event_tags")]
+        no_event_tags: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionConfigCommands {
+    /// Set mutable session configuration
+    Set {
+        /// Session ID
+        #[arg(value_name = "session-id")]
+        session_id: String,
+        /// Default event-memory tags as comma-separated key=value pairs
+        #[arg(
+            long = "event-tags",
+            value_name = "key=value",
+            value_delimiter = ',',
+            required_unless_present_any = [
+                "no_event_tags",
+                "auto_commit_policy_json",
+                "no_auto_commit"
+            ],
+            conflicts_with = "no_event_tags"
+        )]
+        event_tags: Vec<String>,
+        /// Clear the session's default event-memory tags
+        #[arg(
+            long = "no-event-tags",
+            required_unless_present_any = [
+                "event_tags",
+                "auto_commit_policy_json",
+                "no_auto_commit"
+            ],
+            conflicts_with = "event_tags"
+        )]
+        no_event_tags: bool,
+        /// Auto-commit policy fields as a JSON object
+        #[arg(
+            long = "auto-commit-policy-json",
+            value_name = "json",
+            required_unless_present_any = ["event_tags", "no_event_tags", "no_auto_commit"],
+            conflicts_with = "no_auto_commit"
+        )]
+        auto_commit_policy_json: Option<String>,
+        /// Disable automatic commits for this session
+        #[arg(
+            long = "no-auto-commit",
+            required_unless_present_any = [
+                "event_tags",
+                "no_event_tags",
+                "auto_commit_policy_json"
+            ],
+            conflicts_with = "auto_commit_policy_json"
+        )]
+        no_auto_commit: bool,
     },
 }
 
@@ -1426,6 +1564,7 @@ enum SkillCommands {
             long = "node-limit",
             alias = "limit",
             default_value = "1000",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n"
         )]
         node_limit: i32,
@@ -1444,6 +1583,7 @@ enum SkillCommands {
             long = "node-limit",
             alias = "limit",
             default_value = "10",
+            value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n"
         )]
         node_limit: i32,
@@ -1692,7 +1832,17 @@ enum AdminCommands {
         user_config_json: Option<String>,
     },
     /// List all accounts (ROOT only)
-    ListAccounts,
+    ListAccounts {
+        /// Filter accounts by ID (supports wildcard * and ?)
+        #[arg(long, value_name = "pattern")]
+        name: Option<String>,
+        /// Page size; omit to list all accounts
+        #[arg(long, value_name = "n")]
+        limit: Option<u32>,
+        /// 1-based page number (requires --limit)
+        #[arg(long, default_value = "1", value_name = "n")]
+        page: u32,
+    },
     /// Delete an account and all associated users (ROOT only)
     DeleteAccount {
         /// Account ID to delete
@@ -1728,15 +1878,18 @@ enum AdminCommands {
         /// Account ID
         #[arg(value_name = "account-id")]
         account_id: String,
-        /// Maximum number of users to list (default: 100)
-        #[arg(long, default_value = "100", value_name = "n")]
-        limit: u32,
+        /// Page size; omit to list all users
+        #[arg(long, value_name = "n")]
+        limit: Option<u32>,
         /// Filter users by name (supports wildcard * and ?)
         #[arg(long, value_name = "pattern")]
         name: Option<String>,
         /// Filter users by role
         #[arg(long, value_name = "role")]
         role: Option<String>,
+        /// 1-based page number (requires --limit)
+        #[arg(long, default_value = "1", value_name = "n")]
+        page: u32,
     },
     /// Remove a user from an account
     RemoveUser {
@@ -1790,6 +1943,10 @@ impl Commands {
                 action: SkillCommands::Validate { .. },
             } | Commands::Version
         )
+    }
+
+    fn allows_invalid_runtime_config(&self) -> bool {
+        matches!(self, Commands::Config { .. })
     }
 }
 
@@ -2320,9 +2477,6 @@ fn is_top_level_server_command(command: &str) -> bool {
             | "grep"
             | "glob"
             | "add-memory"
-            | "relations"
-            | "link"
-            | "unlink"
             | "export"
             | "backup"
             | "import"
@@ -2654,11 +2808,39 @@ fn language_command_can_run_picker(has_language_value: bool, is_interactive: boo
     has_language_value || is_interactive
 }
 
+fn resolve_output_format(cli_output: Option<OutputFormat>, config: &Config) -> OutputFormat {
+    cli_output.unwrap_or_else(|| OutputFormat::from(config.output.as_str()))
+}
+
+fn render_pre_language_help_request(args: &[OsString]) -> Option<String> {
+    if !args
+        .iter()
+        .skip(1)
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        return None;
+    }
+
+    let error = Cli::try_parse_from(args).err()?;
+    if error.kind() != clap::error::ErrorKind::DisplayHelp {
+        return None;
+    }
+
+    if help_ui::is_top_level_help_request(args) {
+        return Some(help_ui::render_top_level_help());
+    }
+    help_ui::render_command_help_request(args).or_else(|| Some(error.to_string()))
+}
+
 #[tokio::main]
 async fn main() {
     let args = preprocess_cli_args(std::env::args_os().collect());
     let command_display = error_ui::display_command(&args);
     let (pre_parse_output_format, pre_parse_compact) = pre_parse_output_options(&args);
+    if let Some(help) = render_pre_language_help_request(&args) {
+        print!("{help}");
+        return;
+    }
     match ensure_language_selected_before_command(&args).await {
         Ok(true) => {}
         Ok(false) => return,
@@ -2719,7 +2901,7 @@ async fn main() {
         }
     };
 
-    let output_format = cli.output;
+    let output_override = cli.output;
     let compact = cli.compact;
     let legacy_upload_options = UploadCliOptions {
         progress: cli.progress,
@@ -2782,7 +2964,7 @@ async fn main() {
             error_ui::print_runtime_error(
                 &command_display,
                 &e,
-                output_format,
+                pre_parse_output_format,
                 compact,
                 cli.verbose,
             );
@@ -2805,13 +2987,20 @@ async fn main() {
             error_ui::print_runtime_error(
                 &command_display,
                 &e,
-                output_format,
+                pre_parse_output_format,
                 compact,
                 cli.verbose,
             );
             std::process::exit(2);
         }
     };
+    let output_format = resolve_output_format(output_override, &config);
+    if !cli.command.allows_invalid_runtime_config()
+        && let Err(e) = config.validate_runtime_values()
+    {
+        error_ui::print_runtime_error(&command_display, &e, output_format, compact, cli.verbose);
+        std::process::exit(2);
+    }
     let ctx = CliContext::from_config(
         config,
         output_format,
@@ -2857,9 +3046,6 @@ async fn main() {
             path,
             add_type,
             manifest,
-            catalog,
-            dry_run,
-            skip_failed,
             to,
             parent,
             parent_auto_create,
@@ -2882,20 +3068,28 @@ async fn main() {
             let ctx =
                 ctx.with_upload_options(upload_options.merged_with_legacy(legacy_upload_options));
             if let Some(manifest) = manifest {
-                openviking_assets::handle_manifest_apply(
-                    manifest,
-                    catalog,
-                    openviking_assets::ManifestRunOptions {
-                        dry_run,
-                        skip_failed,
-                        wait,
-                        watch_interval,
-                        processing_mode,
-                    },
-                    timeout,
-                    ctx,
-                )
-                .await
+                match handlers::parse_add_resource_args(resource_args.as_deref())
+                    .and_then(|args| openviking_assets::parse_manifest_run_args(args.as_ref()))
+                {
+                    Err(e) => Err(e),
+                    Ok(run) => {
+                        openviking_assets::handle_manifest_apply(
+                            manifest,
+                            run.catalog,
+                            openviking_assets::ManifestRunOptions {
+                                dry_run: run.dry_run,
+                                skip_failed: run.skip_failed,
+                                wait,
+                                watch_interval,
+                                processing_mode,
+                                external_connector: run.external_connector,
+                            },
+                            timeout,
+                            ctx,
+                        )
+                        .await
+                    }
+                }
             } else if let Some(path) = path {
                 handlers::handle_add_resource(
                     path,
@@ -3062,15 +3256,6 @@ async fn main() {
                     .await
             }
         },
-        Commands::Relations { uri } => handlers::handle_relations(uri, ctx).await,
-        Commands::Link {
-            from_uri,
-            to_uris,
-            reason,
-        } => handlers::handle_link(from_uri, to_uris, reason, ctx).await,
-        Commands::Unlink { from_uri, to_uri } => {
-            handlers::handle_unlink(from_uri, to_uri, ctx).await
-        }
         Commands::Export {
             uri,
             to,
@@ -3255,6 +3440,7 @@ async fn main() {
             reason,
             wait,
             timeout,
+            runtime_timeout,
         } => {
             let client = ctx.get_client();
             commands::compile::run(
@@ -3265,6 +3451,7 @@ async fn main() {
                 reason,
                 wait,
                 timeout,
+                runtime_timeout,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -3307,6 +3494,7 @@ async fn main() {
             append,
             mode,
             wait,
+            processing_mode,
             timeout,
         } => {
             let effective_mode = if let Some(m) = mode {
@@ -3316,8 +3504,17 @@ async fn main() {
             } else {
                 "replace".to_string()
             };
-            handlers::handle_write(uri, content, from_file, effective_mode, wait, timeout, ctx)
-                .await
+            handlers::handle_write(
+                uri,
+                content,
+                from_file,
+                effective_mode,
+                wait,
+                timeout,
+                processing_mode,
+                ctx,
+            )
+            .await
         }
         Commands::SetTags {
             uri,
@@ -3330,7 +3527,12 @@ async fn main() {
             mode,
             wait,
             dry_run,
-        } => handlers::handle_reindex(uri, mode, wait, dry_run, ctx).await,
+            tags,
+            tag_mode,
+            recursive,
+        } => {
+            handlers::handle_reindex(uri, mode, wait, dry_run, tags, tag_mode, recursive, ctx).await
+        }
         Commands::Get { uri, local_path } => handlers::handle_get(uri, local_path, ctx).await,
         Commands::Find {
             query,
@@ -3343,6 +3545,7 @@ async fn main() {
             level,
             context_type,
             tags,
+            read_content,
         } => {
             handlers::handle_find(
                 query,
@@ -3355,6 +3558,7 @@ async fn main() {
                 level,
                 context_type,
                 tags,
+                read_content,
                 ctx,
             )
             .await
@@ -3371,6 +3575,7 @@ async fn main() {
             level,
             context_type,
             tags,
+            read_content,
         } => {
             handlers::handle_search(
                 query,
@@ -3384,6 +3589,7 @@ async fn main() {
                 level,
                 context_type,
                 tags,
+                read_content,
                 ctx,
             )
             .await
@@ -3433,11 +3639,12 @@ async fn main() {
 mod tests {
     use super::{
         Cli, CliContext, Commands, ConfigAddTarget, ConfigCommands, LanguageGateAction,
-        PrivacyCommands, SkillCommands, SnapshotCmd, UploadCliOptions, find_command_index,
-        first_command_token, is_language_command_request, language_command_can_run_picker,
-        language_gate_action, language_required_message, legacy_upload_option_error,
-        plain_help_misuse, pre_parse_output_options, pre_parse_requires_cli_config_file,
-        preprocess_cli_args, preprocess_privacy_args,
+        ObserverCommands, PrivacyCommands, SkillCommands, SnapshotCmd, UploadCliOptions,
+        find_command_index, first_command_token, is_language_command_request,
+        language_command_can_run_picker, language_gate_action, language_required_message,
+        legacy_upload_option_error, plain_help_misuse, pre_parse_output_options,
+        pre_parse_requires_cli_config_file, preprocess_cli_args, preprocess_privacy_args,
+        render_pre_language_help_request, resolve_output_format,
     };
     use crate::config::{Config, DEFAULT_CUSTOM_URL};
     use crate::output::OutputFormat;
@@ -3642,6 +3849,8 @@ mod tests {
             "--wait",
             "--timeout",
             "10",
+            "--runtime-timeout",
+            "86400",
         ])
         .expect("compile flags should parse");
         match cli.command {
@@ -3651,6 +3860,7 @@ mod tests {
                 reason,
                 wait,
                 timeout,
+                runtime_timeout,
                 ..
             } => {
                 assert_eq!(from_uris.len(), 3);
@@ -3658,6 +3868,7 @@ mod tests {
                 assert!(reason.is_none());
                 assert!(wait);
                 assert_eq!(timeout, Some(10.0));
+                assert_eq!(runtime_timeout, Some(86_400.0));
             }
             _ => panic!("expected compile command"),
         }
@@ -3886,9 +4097,6 @@ mod tests {
             "grep",
             "glob",
             "add-memory",
-            "relations",
-            "link",
-            "unlink",
             "export",
             "backup",
             "import",
@@ -4055,6 +4263,22 @@ mod tests {
         assert!(help.contains("--progress"));
         assert!(help.contains("--no-progress"));
         assert!(help.contains("--verbose"));
+        assert!(!help.contains("--parse-mode"));
+        assert!(help.contains("--args"));
+    }
+
+    #[test]
+    fn cli_add_resource_rejects_top_level_parse_mode() {
+        assert!(
+            Cli::try_parse_from([
+                "ov",
+                "add-resource",
+                "./README.md",
+                "--parse-mode",
+                "no_split",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -4327,7 +4551,7 @@ mod tests {
         let show_global_output =
             Cli::try_parse_from(["ov", "skills", "show", "code-review", "-o", "json"])
                 .expect("skills show should accept global -o after the subcommand");
-        assert_eq!(show_global_output.output, OutputFormat::Json);
+        assert_eq!(show_global_output.output, Some(OutputFormat::Json));
 
         let remove = Cli::try_parse_from(["ov", "skills", "remove", "foo", "bar", "--yes"])
             .expect("skills remove --yes should parse");
@@ -4477,6 +4701,154 @@ mod tests {
         match cli.command {
             Commands::Language { language } => assert!(language.is_none()),
             _ => panic!("expected language command"),
+        }
+    }
+
+    #[test]
+    fn all_timeout_options_require_positive_finite_seconds() {
+        let command_prefixes = [
+            vec!["ov", "add-resource", "https://example.com", "--timeout"],
+            vec!["ov", "add-skill", "skill", "--timeout"],
+            vec!["ov", "rm", "viking://resources/item", "--timeout"],
+            vec![
+                "ov",
+                "write",
+                "viking://resources/item",
+                "--content",
+                "value",
+                "--timeout",
+            ],
+            vec![
+                "ov",
+                "compile",
+                "--from",
+                "viking://resources/source",
+                "--to",
+                "viking://resources/target",
+                "--skill",
+                "viking://user/skills/compiler",
+                "--wait",
+                "--timeout",
+            ],
+            vec!["ov", "wait", "--timeout"],
+            vec!["ov", "system", "wait", "--timeout"],
+        ];
+
+        for prefix in command_prefixes {
+            for invalid in ["0", "-1", "inf", "NaN", "1e300"] {
+                let mut args = prefix.clone();
+                args.push(invalid);
+                assert!(
+                    Cli::try_parse_from(&args).is_err(),
+                    "{args:?} should reject an invalid timeout"
+                );
+            }
+
+            let mut args = prefix;
+            args.push("0.1");
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{args:?} should accept a positive finite timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn all_node_limit_options_accept_zero_and_reject_negative_values() {
+        let command_prefixes = [
+            vec!["ov", "ls", "--node-limit"],
+            vec!["ov", "tree", "viking://resources", "--node-limit"],
+            vec!["ov", "find", "query", "--node-limit"],
+            vec!["ov", "search", "query", "--node-limit"],
+            vec!["ov", "grep", "query", "--node-limit"],
+            vec!["ov", "glob", "**/*", "--node-limit"],
+            vec!["ov", "skills", "list", "--node-limit"],
+            vec!["ov", "skills", "find", "query", "--node-limit"],
+        ];
+
+        for prefix in command_prefixes {
+            let mut negative_args = prefix.clone();
+            negative_args.push("-1");
+            assert!(
+                Cli::try_parse_from(&negative_args).is_err(),
+                "{negative_args:?} should reject a negative node limit"
+            );
+
+            let mut zero_args = prefix.clone();
+            zero_args.push("0");
+            assert!(
+                Cli::try_parse_from(&zero_args).is_ok(),
+                "{zero_args:?} should preserve the established zero-limit semantics"
+            );
+
+            let mut args = prefix;
+            args.push("1");
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{args:?} should accept a positive node limit"
+            );
+        }
+    }
+
+    #[test]
+    fn config_commands_can_load_invalid_runtime_values_for_repair() {
+        let cli = Cli::try_parse_from(["ov", "config", "show"]).expect("config show should parse");
+        assert!(cli.command.allows_invalid_runtime_config());
+
+        let status = Cli::try_parse_from(["ov", "status"]).expect("status should parse");
+        assert!(!status.command.allows_invalid_runtime_config());
+    }
+
+    #[test]
+    fn configured_output_is_used_unless_cli_overrides_it() {
+        let config = Config {
+            output: "json".to_string(),
+            ..Config::default()
+        };
+
+        assert_eq!(resolve_output_format(None, &config), OutputFormat::Json);
+        assert_eq!(
+            resolve_output_format(Some(OutputFormat::Table), &config),
+            OutputFormat::Table
+        );
+        let cli = Cli::try_parse_from(["ov", "status"]).unwrap();
+        assert_eq!(cli.output, None);
+
+        let invalid_config = Config {
+            output: "yaml".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_output_format(None, &invalid_config),
+            OutputFormat::Table,
+            "repair commands need a safe fallback for invalid persisted output"
+        );
+    }
+
+    #[test]
+    fn only_explicit_clap_help_bypasses_language_setup() {
+        for args in [
+            ["ov", "--help"].as_slice(),
+            ["ov", "-h"].as_slice(),
+            ["ov", "status", "--help"].as_slice(),
+            ["ov", "system", "wait", "-h"].as_slice(),
+        ] {
+            assert!(
+                render_pre_language_help_request(&os_args(args)).is_some(),
+                "{args:?} should render before language setup"
+            );
+        }
+
+        for args in [
+            ["ov", "status"].as_slice(),
+            ["ov", "task"].as_slice(),
+            ["ov", "-help"].as_slice(),
+            ["ov", "--account", "--help", "status"].as_slice(),
+        ] {
+            assert!(
+                render_pre_language_help_request(&os_args(args)).is_none(),
+                "{args:?} should keep the language gate"
+            );
         }
     }
 
@@ -4750,6 +5122,10 @@ mod tests {
             extra_headers: None,
             profile: false,
             gateway_token: None,
+            auth_mode: None,
+            ldap_username: None,
+            ldap_password: None,
+            oidc_token: None,
         };
 
         let ctx = CliContext::from_config(
@@ -4790,6 +5166,10 @@ mod tests {
             extra_headers: None,
             profile: false,
             gateway_token: None,
+            auth_mode: None,
+            ldap_username: None,
+            ldap_password: None,
+            oidc_token: None,
         };
 
         let ctx = CliContext::from_config(
@@ -4828,6 +5208,10 @@ mod tests {
             upload: Default::default(),
             extra_headers: None,
             gateway_token: None,
+            auth_mode: None,
+            ldap_username: None,
+            ldap_password: None,
+            oidc_token: None,
         };
 
         // Without sudo: use api_key
@@ -4862,6 +5246,36 @@ mod tests {
         );
         let client = ctx.get_client();
         assert_eq!(client.api_key(), Some("root-key"));
+    }
+
+    #[test]
+    fn observer_alias_and_snapshot_restore_examples_parse() {
+        let observer = Cli::try_parse_from(["ov", "observer", "fs"]).unwrap();
+        assert!(matches!(
+            observer.command,
+            Commands::Observer {
+                action: ObserverCommands::Filesystem
+            }
+        ));
+
+        let snapshot = Cli::try_parse_from([
+            "ov",
+            "snapshot",
+            "restore",
+            "abc123",
+            "viking://projects/acme",
+        ])
+        .unwrap();
+        assert!(matches!(
+            snapshot.command,
+            Commands::Snapshot {
+                cmd: SnapshotCmd::Restore {
+                    source_commit,
+                    project_dir,
+                    ..
+                }
+            } if source_commit == "abc123" && project_dir.as_deref() == Some("viking://projects/acme")
+        ));
     }
 
     #[test]
@@ -4912,31 +5326,54 @@ mod tests {
     }
 
     #[test]
-    fn cli_manifest_mode_accepts_explicit_catalog() {
+    fn cli_manifest_mode_takes_run_options_via_args() {
         let result = Cli::try_parse_from([
             "ov",
             "add-resource",
             "--manifest",
             "manifests/code-qa.yaml",
-            "--catalog",
-            "assets.yaml",
-            "--dry-run",
+            "--args",
+            "catalog:catalog.yaml,dry_run:true,skip_failed:true",
         ]);
 
-        assert!(result.is_ok(), "manifest and catalog flags should parse");
+        assert!(result.is_ok(), "manifest mode with --args should parse");
     }
 
     #[test]
-    fn cli_catalog_requires_manifest_mode() {
-        let result = Cli::try_parse_from([
-            "ov",
-            "add-resource",
-            "https://github.com/org/repo",
-            "--catalog",
-            "assets.yaml",
-        ]);
+    fn cli_manifest_mode_dropped_dedicated_run_flags() {
+        for flag in [
+            "--catalog=catalog.yaml",
+            "--dry-run",
+            "--skip-failed",
+            "--external-connector",
+        ] {
+            let result =
+                Cli::try_parse_from(["ov", "add-resource", "--manifest", "code-qa.yaml", flag]);
+            assert!(
+                result.is_err(),
+                "removed manifest flag {flag} should not parse"
+            );
+        }
+    }
 
-        assert!(result.is_err(), "--catalog without --manifest must fail");
+    #[test]
+    fn cli_manifest_mode_rejects_silently_ignored_single_resource_options() {
+        for args in [
+            ["--reason", "why"],
+            ["--instruction", "how"],
+            ["--no-directly-upload-media", "--wait"],
+        ] {
+            let result = Cli::try_parse_from(
+                ["ov", "add-resource", "--manifest", "code-qa.yaml"]
+                    .into_iter()
+                    .chain(args),
+            );
+            assert!(
+                result.is_err(),
+                "{} must conflict with --manifest instead of being ignored",
+                args[0]
+            );
+        }
     }
 
     #[test]
@@ -4949,9 +5386,27 @@ mod tests {
             "prune_orphans",
             "--wait=false",
             "--dry-run",
+            "--tag",
+            "team=search",
+            "--tag-mode",
+            "append",
+            "--recursive=false",
         ]);
 
-        assert!(result.is_ok(), "reindex command should parse");
+        let cli = result.expect("reindex command should parse");
+        match cli.command {
+            Commands::Reindex {
+                tags,
+                tag_mode,
+                recursive,
+                ..
+            } => {
+                assert_eq!(tags, vec!["team=search"]);
+                assert_eq!(tag_mode, "append");
+                assert!(!recursive);
+            }
+            _ => panic!("expected reindex command"),
+        }
     }
 
     #[test]
