@@ -31,8 +31,9 @@ Create a new session. Sessions are containers for conversations, storing message
 
 **Code Entries:**
 - `openviking/session/session.py:Session.__init__()` - Core Session class
+- `openviking/session/auto_commit_policy.py:AutoCommitPolicy` - Auto-commit policy defaults and validation
 - `openviking/server/routers/sessions.py:create_session()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.create_session()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.create_session()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:new_session()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -42,7 +43,20 @@ Create a new session. Sessions are containers for conversations, storing message
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | session_id | str | No | None | Session ID. Creates new session with auto-generated ID if None |
-| memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, optional `working_memory.enabled=false` skips archive summaries, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
+| memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, optional `working_memory.enabled=false` skips archive summaries, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. Including `experiences` automatically activates `cases` and `trajectories`; without `experiences`, explicitly supplied `cases` and `trajectories` are ignored. Use JSON booleans for every `enabled` value. Legacy boolean-like values remain accepted temporarily (including string `"false"`, which is parsed as false) but emit a deprecation warning. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
+| auto_commit_policy | object | No | None | Optional auto-commit policy (see table below). Any provided fields are validated, clamped to their bounds, and merged over the defaults; the effective policy is returned in the response `result.auto_commit_policy` and persisted into session metadata. If no policy is provided, auto commit is disabled unless `memory.session_auto_commit.default_enabled=true`. The policy can later be partially updated or disabled through `update_session_config()`. |
+
+`auto_commit_policy` fields (all optional; omitted fields fall back to the defaults when a policy is present):
+
+| Field | Type | Default | Max | Description |
+|-------|------|---------|-----|-------------|
+| `pending_token_threshold` | int | 150000 | 1000000 | When uncommitted pending tokens exceed this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `message_count_threshold` | int | 100 | 1000 | When the uncommitted live message count exceeds this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `idle_timeout_seconds` | int | 86400 | 604800 | After this many idle seconds, a session with uncommitted content becomes eligible for the server-side idle scheduler. An idle-timeout commit archives the full backlog and ignores `keep_recent_count`. |
+| `keep_recent_count` | int | 0 | 500 | Number of recent live messages to keep (not archived) on a threshold-triggered auto commit. Idle-timeout commits ignore this and commit everything. |
+| `min_commit_interval_seconds` | int | 0 | 604800 | Minimum seconds between two automatic commits (throttle). |
+
+All fields have a minimum of `0` and are clamped into `[0, max]`. Unknown keys are rejected with `InvalidArgumentError`.
 
 #### 3. Usage Examples
 
@@ -63,6 +77,20 @@ curl -X POST http://localhost:1933/api/v1/sessions \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{"session_id": "my-custom-session-id"}'
+
+# Create new session with a custom auto-commit policy
+curl -X POST http://localhost:1933/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "auto_commit_policy": {
+      "pending_token_threshold": 8000,
+      "message_count_threshold": 40,
+      "idle_timeout_seconds": 600,
+      "keep_recent_count": 10,
+      "min_commit_interval_seconds": 0
+    }
+  }'
 ```
 
 **Python SDK**
@@ -71,7 +99,8 @@ curl -X POST http://localhost:1933/api/v1/sessions \
 import openviking as ov
 
 # Use HTTP client
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Create new session (auto-generated ID)
 result = await client.create_session()
@@ -80,6 +109,20 @@ print(f"Session ID: {result['session_id']}")
 # Create new session with specified ID
 result = await client.create_session(session_id="my-custom-session-id")
 print(f"Session ID: {result['session_id']}")
+
+# Create new session with a custom auto-commit policy
+result = await client.create_session(
+    options={
+        "auto_commit_policy": {
+            "pending_token_threshold": 8000,
+            "message_count_threshold": 40,
+            "idle_timeout_seconds": 600,
+            "keep_recent_count": 10,
+            "min_commit_interval_seconds": 0,
+        },
+    },
+)
+print(result["auto_commit_policy"])
 ```
 
 **TypeScript SDK**
@@ -118,7 +161,8 @@ ov session new
     "user": {
       "account_id": "default",
       "user_id": "alice"
-    }
+    },
+    "auto_commit_policy": null
   },
   "time": 0.1
 }
@@ -134,7 +178,7 @@ List all sessions for the current user. Returns session IDs and URI info for fur
 
 **Code Entries:**
 - `openviking/server/routers/sessions.py:list_sessions()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.list_sessions()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.list_sessions()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:list_sessions()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -159,9 +203,10 @@ curl -X GET http://localhost:1933/api/v1/sessions \
 **Python SDK**
 
 ```python
-import openviking as ov
+from openviking_sdk import AsyncHTTPClient
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 sessions = await client.list_sessions()
 for s in sessions:
@@ -227,11 +272,12 @@ Get session details including metadata, message statistics, commit history, etc.
 - `commit_count`: Number of successful commits
 - `memories_extracted`: Count statistics of extracted memories by category
 - `last_commit_at`: Time of last commit
+- `auto_commit_policy`: Effective auto-commit policy with defaults filled in; `null` when not enabled
 
 **Code Entries:**
 - `openviking/session/session.py:Session.load()` - Session loading
 - `openviking/server/routers/sessions.py:get_session()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.get_session()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:get_session()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -259,18 +305,19 @@ curl -X GET http://localhost:1933/api/v1/sessions/a1b2c3d4 \
 **Python SDK**
 
 ```python
-import openviking as ov
+from openviking_sdk import AsyncHTTPClient
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Get existing session (raises NotFoundError if not found)
-info = await client.get_session("a1b2c3d4")
+info = await client.get_session(session_id="a1b2c3d4")
 print(f"Live Messages: {info['message_count']}")
 print(f"Total Messages: {info.get('total_message_count', 'n/a')}")
 print(f"Commits: {info['commit_count']}")
 
 # Get or create session
-info = await client.get_session("a1b2c3d4", auto_create=True)
+info = await client.get_session(session_id="a1b2c3d4", auto_create=True)
 ```
 
 **TypeScript SDK**
@@ -343,7 +390,154 @@ ov session get a1b2c3d4
       "account_id": "default",
       "user_id": "alice"
     },
-    "pending_tokens": 450
+    "pending_tokens": 450,
+    "auto_commit_policy": {
+      "pending_token_threshold": 150000,
+      "message_count_threshold": 100,
+      "idle_timeout_seconds": 86400,
+      "keep_recent_count": 0,
+      "min_commit_interval_seconds": 0
+    }
+  }
+}
+```
+
+---
+
+### update_session_config()
+
+#### 1. API Implementation Introduction
+
+Partially update the mutable configuration of an existing session. Changes take
+effect on subsequent message writes, idle scans, and commits. Only the
+`/api/v1/sessions/{session_id}/config` subpath accepts `PATCH`; the base
+`/api/v1/sessions/{session_id}` endpoint does not.
+
+**Code Entry Points**:
+- `openviking/server/routers/sessions.py:update_session_config()` - HTTP route
+- `openviking/service/session_service.py:SessionService.update_config()` - Config validation and update
+- `sdk/python/openviking_sdk/client.py:update_session_config()` - Python SDK
+- `sdk/typescript/src/client.ts:updateSessionConfig()` - TypeScript SDK
+- `sdk/go/sessions.go:UpdateSessionConfig()` - Go SDK
+- `crates/ov_cli/src/commands/session.rs:set_session_config()` - CLI command
+
+#### 2. Interface and Parameter Description
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| session_id | string | Yes | - | Session ID in the URL path |
+| memory_extraction_config | object | No | Omitted | Mutable extraction settings. Currently supports `events.tags`, an array of strict `key=value` strings. Omit it to preserve the current tags; pass `events.tags=[]` to clear them. Tags are trimmed, lowercased, and deduplicated. |
+| auto_commit_policy | object or null | No | Omitted | An object merges only the supplied policy fields into the current policy, with the same validation, clamping, defaults, and bounds documented under `create_session()`. Pass `null` to disable automatic commits; omit the field to leave the policy unchanged. Individual policy fields cannot be `null`. |
+| telemetry | boolean or object | No | `false` | Set to `true`, or pass `{"summary": true}`, to include the operation telemetry summary in the response. `false` omits it. |
+
+An empty request object is a valid no-op and returns the effective configuration.
+Unknown request fields are rejected. The response always returns the effective
+policy with defaults filled in, or `null` when automatic commits are disabled.
+
+#### 3. Usage Examples
+
+**HTTP API**
+
+```http
+PATCH /api/v1/sessions/{session_id}/config
+```
+
+```bash
+# Merge one policy field and replace the default event-memory tags
+curl -X PATCH http://localhost:1933/api/v1/sessions/a1b2c3d4/config \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "memory_extraction_config": {
+      "events": {"tags": ["team=search", "channel=app"]}
+    },
+    "auto_commit_policy": {"message_count_threshold": 25},
+    "telemetry": true
+  }'
+
+# Disable automatic commits without changing event-memory tags
+curl -X PATCH http://localhost:1933/api/v1/sessions/a1b2c3d4/config \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"auto_commit_policy": null}'
+```
+
+**Python SDK**
+
+```python
+result = client.update_session_config(
+    session_id="a1b2c3d4",
+    options={
+        "memory_extraction_config": {
+            "events": {"tags": ["team=search", "channel=app"]}
+        },
+        "auto_commit_policy": {"message_count_threshold": 25},
+    },
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+const result = await client.updateSessionConfig("a1b2c3d4", {
+  memoryExtractionConfig: {
+    events: { tags: ["team=search", "channel=app"] },
+  },
+  autoCommitPolicy: { message_count_threshold: 25 },
+});
+```
+
+**Go SDK**
+
+```go
+policy := map[string]any{"message_count_threshold": 25}
+result, err := client.UpdateSessionConfig(ctx, "a1b2c3d4", &openviking.UpdateSessionConfigOptions{
+    MemoryExtractionConfig: map[string]any{
+        "events": map[string]any{"tags": []string{"team=search", "channel=app"}},
+    },
+    AutoCommitPolicy: &policy,
+})
+```
+
+**CLI**
+
+```bash
+ov session config set a1b2c3d4 \
+  --event-tags team=search,channel=app \
+  --auto-commit-policy-json '{"message_count_threshold":25}'
+
+# Clear the default tags, or disable automatic commits
+ov session config set a1b2c3d4 --no-event-tags
+ov session config set a1b2c3d4 --no-auto-commit
+```
+
+**Response example**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "session_id": "a1b2c3d4",
+    "auto_commit_policy": {
+      "pending_token_threshold": 150000,
+      "message_count_threshold": 25,
+      "idle_timeout_seconds": 86400,
+      "keep_recent_count": 0,
+      "min_commit_interval_seconds": 0
+    },
+    "memory_extraction_config": {
+      "events": {
+        "tags": ["team=search", "channel=app"]
+      }
+    }
+  },
+  "telemetry": {
+    "id": "tm_xxx",
+    "summary": {
+      "operation": "session.update_config",
+      "status": "ok",
+      "duration_ms": 4.2
+    }
   }
 }
 ```
@@ -510,7 +704,7 @@ Get the assembled session context used for LLM context building. This endpoint r
 **Code Entries:**
 - `openviking/session/session.py:Session.get_session_context()` - Core implementation
 - `openviking/server/routers/sessions.py:get_session_context()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.get_session_context()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session_context()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:get_session_context()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -538,11 +732,12 @@ curl -X GET "http://localhost:1933/api/v1/sessions/a1b2c3d4/context?token_budget
 **Python SDK**
 
 ```python
-import openviking as ov
+from openviking_sdk import AsyncHTTPClient
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
-context = await client.get_session_context("a1b2c3d4", token_budget=128000)
+context = await client.get_session_context(session_id="a1b2c3d4", token_budget=128000)
 print(context["latest_archive_overview"])
 print(len(context["messages"]))
 ```
@@ -619,7 +814,7 @@ Get the full contents of one completed archive for a session. This endpoint is t
 **Code Entries:**
 - `openviking/session/session.py:Session.get_session_archive()` - Core implementation
 - `openviking/server/routers/sessions.py:get_session_archive()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.get_session_archive()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session_archive()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:get_session_archive()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -649,9 +844,13 @@ curl -X GET "http://localhost:1933/api/v1/sessions/a1b2c3d4/archives/archive_002
 ```python
 import openviking as ov
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
-archive = await client.get_session_archive("a1b2c3d4", "archive_002")
+archive = await client.get_session_archive(
+    session_id="a1b2c3d4",
+    archive_id="archive_002",
+)
 print(archive["archive_id"])
 print(archive["overview"])
 print(len(archive["messages"]))
@@ -734,7 +933,7 @@ Delete a session and all its data, including messages, archive history, memories
 
 **Code Entries:**
 - `openviking/server/routers/sessions.py:delete_session()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.delete_session()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.delete_session()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:delete_session()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -763,10 +962,11 @@ curl -X DELETE http://localhost:1933/api/v1/sessions/a1b2c3d4 \
 ```python
 import openviking as ov
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Delete session
-await client.delete_session("a1b2c3d4")
+await client.delete_session(session_id="a1b2c3d4")
 ```
 
 **TypeScript SDK**
@@ -818,7 +1018,7 @@ Add a message to the session. Supports two modes: simple text mode and Parts mod
 **Code Entries:**
 - `openviking/session/session.py:Session.add_message()` - Core implementation
 - `openviking/server/routers/sessions.py:add_message()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.add_message()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.add_message()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:add_message()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -829,10 +1029,10 @@ Add a message to the session. Supports two modes: simple text mode and Parts mod
 |-----------|------|----------|---------|-------------|
 | session_id | str | Yes | - | Session ID |
 | role | str | Yes | - | Message role: "user" or "assistant" |
-| parts | List[Part] | Conditional | - | List of message parts (Required for Python SDK; Optional for HTTP API, mutually exclusive with content) |
-| content | str | Conditional | - | Message text content (HTTP API simple mode, mutually exclusive with parts) |
-| created_at | str | No | None | Optional ISO 8601 timestamp to persist on the message |
+| parts | List[dict \| MessagePart] | Conditional | - | SDK part dictionaries or `TextPart`/`ContextPart`/`ImagePart`/`ToolPart` objects; HTTP API accepts dictionaries only; mutually exclusive with content |
+| content | str | Conditional | - | Message text content (simple mode; mutually exclusive with parts) |
 | peer_id | str | No | None | Optional stable interaction peer identity |
+| options | AddMessageOptions | No | None | Advanced message options such as `created_at`, `telemetry`, `turn_id`, `message_kind`, and `source_message_ids` |
 
 > **Note**: HTTP API supports two modes:
 > 1. **Simple mode**: Use `content` string (backward compatible)
@@ -843,7 +1043,7 @@ Add a message to the session. Supports two modes: simple text mode and Parts mod
 **Part Types (Python SDK)**
 
 ```python
-from openviking.message import TextPart, ImagePart, ContextPart, ToolPart
+from openviking_sdk import ContextPart, ImagePart, TextPart, ToolPart
 
 # Text content
 TextPart(text="Hello, how can I help?")
@@ -855,19 +1055,21 @@ ImagePart(url="https://example.com/photo.png", detail="auto")
 ContextPart(
     uri="viking://resources/docs/auth/",
     context_type="resource",  # "resource", "memory", or "skill"
-    abstract="Authentication guide..."
+    abstract="Authentication guide...",
 )
 
 # Tool call
 ToolPart(
     tool_id="call_123",
     tool_name="search_web",
-    skill_uri="viking://user/skills/search-web/",
+    skill_uri="viking://~/skills/search-web/",
     tool_input={"query": "OAuth best practices"},
-    tool_output="",
-    tool_status="pending"  # "pending", "running", "completed", "error"
+    tool_status="pending",  # "pending", "running", "completed", "error"
 )
 ```
+
+You can also pass the equivalent dictionaries when you need to share the same
+payload shape with HTTP, Go, or TypeScript code.
 
 #### 3. Usage Examples
 
@@ -934,15 +1136,16 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages \
 
 ```python
 import openviking as ov
-from openviking.message import TextPart, ImagePart, ContextPart
+from openviking_sdk import ContextPart, ImagePart, TextPart
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Simple mode: Add user message
 await client.add_message(
     session_id="a1b2c3d4",
     role="user",
-    content="How do I authenticate users?"
+    content="How do I authenticate users?",
 )
 
 # Parts mode: Add assistant message with context reference
@@ -954,9 +1157,9 @@ await client.add_message(
         ContextPart(
             uri="viking://resources/docs/auth/",
             context_type="resource",
-            abstract="Authentication guide"
-        )
-    ]
+            abstract="Authentication guide",
+        ),
+    ],
 )
 
 # Parts mode: Add user message with an image URL
@@ -966,7 +1169,7 @@ await client.add_message(
     parts=[
         TextPart(text="Remember this studio layout."),
         ImagePart(url="https://example.com/studio.png", detail="auto"),
-    ]
+    ],
 )
 ```
 
@@ -1023,7 +1226,7 @@ Add multiple messages to a session in a single request. Suitable for scenarios t
 **Code Entry Points**:
 - `openviking/session/session.py:Session.add_messages()` - Core implementation
 - `openviking/server/routers/sessions.py:batch_add_messages()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.batch_add_messages()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.batch_add_messages()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:add_messages()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -1034,7 +1237,7 @@ Add multiple messages to a session in a single request. Suitable for scenarios t
 |------|------|------|--------|------|
 | session_id | str | Yes | - | Session ID |
 | messages | List[AddMessageRequest] | Yes | - | List of messages, each following the same format as `add_message()`, max 100 |
-| telemetry | bool | No | False | Whether to attach operation telemetry data |
+| options | BatchAddMessagesOptions | No | None | Advanced batch options such as `telemetry`; pass `options={"telemetry": true}` to include operation telemetry data |
 
 > **Note**: Each message follows the exact same format as `add_message()`, supporting both `content` (simple mode) and `parts` (Parts mode). If you need to add more than 100 messages, call in batches.
 
@@ -1063,9 +1266,10 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages/batch \
 **Python SDK**
 
 ```python
-import openviking as ov
+from openviking_sdk import AsyncHTTPClient
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Add messages in batch
 result = await client.batch_add_messages(
@@ -1167,7 +1371,7 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
-  -d '{"skill": {"uri": "viking://user/skills/search-web/", "input": {"query": "OAuth"}, "output": "Results...", "success": true}}'
+  -d '{"skill": {"uri": "viking://~/skills/search-web/", "input": {"query": "OAuth"}, "output": "Results...", "success": true}}'
 ```
 
 **Response Example**
@@ -1194,7 +1398,7 @@ Commit a session. Message archiving (Phase 1) completes immediately. Summary gen
 
 **Two-Phase Commit Flow:**
 - **Phase 1 (Synchronous)**: Snapshot current messages, clear live session, create archive directory, write original messages
-- **Phase 2 (Asynchronous)**: Generate summaries (L0/L1), extract long-term memories, update relations and active_count
+- **Phase 2 (Asynchronous)**: Generate summaries (L0/L1), extract long-term memories, and update active_count
 
 **Notes:**
 - Rapid consecutive commits on the same session are accepted; each request gets its own `task_id`.
@@ -1206,7 +1410,7 @@ Commit a session. Message archiving (Phase 1) completes immediately. Summary gen
 **Code Entries:**
 - `openviking/session/session.py:Session.commit_async()` - Core implementation
 - `openviking/server/routers/sessions.py:commit_session()` - HTTP route
-- `openviking_cli/client/base.py:BaseClient.commit_session()` - Python SDK
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.commit_session()` - Python SDK
 - `crates/ov_cli/src/commands/session.rs:commit_session()` - CLI command
 
 #### 2. Interface and Parameter Description
@@ -1217,6 +1421,10 @@ Commit a session. Message archiving (Phase 1) completes immediately. Summary gen
 |-----------|------|----------|---------|-------------|
 | session_id | str | Yes | - | Session ID to commit |
 | keep_recent_count | int | No | 0 | Number of recent live messages to retain (kept live, not archived) after commit. `0` (default) archives all messages. |
+
+The effective policy is resolved in this order: Session `.meta.json`, latest
+`settings/user_config.json`, then the kernel default. The fully resolved policy
+is stored in the queued task before Phase 2 starts.
 
 #### 3. Usage Examples
 
@@ -1242,15 +1450,16 @@ curl -X GET http://localhost:1933/api/v1/tasks/{task_id} \
 ```python
 import openviking as ov
 
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Commit returns immediately with task_id; summary + memory extraction runs in background
-result = await client.commit_session("a1b2c3d4")
+result = await client.commit_session(session_id="a1b2c3d4")
 print(f"Status: {result['status']}")
 print(f"Task ID: {result['task_id']}")
 
 # Poll background task status
-task = await client.get_task(result["task_id"])
+task = await client.get_task(task_id=result["task_id"])
 if task["status"] == "completed":
     memories = task["result"]["memories_extracted"]
     total = sum(memories.values())
@@ -1381,7 +1590,6 @@ viking://user/{user_id}/sessions/{session_id}/
 |   +-- {tool_id}/
 |       +-- tool.json
 +-- .meta.json                # Metadata
-+-- .relations.json           # Related contexts
 +-- history/                  # Archived history
     +-- archive_001/
     |   +-- messages.jsonl    # Written in Phase 1
@@ -1426,10 +1634,19 @@ When long-term memory extraction runs successfully, the commit writes a `memory_
       }
     ]
   },
+  "skipped_operations": [
+    {
+      "memory_type": "events",
+      "page_id": 101,
+      "reason_code": "invalid_ranges",
+      "reason": "No valid event range could be resolved"
+    }
+  ],
   "summary": {
     "total_adds": 1,
     "total_updates": 1,
-    "total_deletes": 1
+    "total_deletes": 1,
+    "total_skipped": 1
   }
 }
 ```
@@ -1441,11 +1658,13 @@ When long-term memory extraction runs successfully, the commit writes a `memory_
 | `operations.adds` | array | New memories created (`uri`, `memory_type`, `after`) |
 | `operations.updates` | array | Modified memories (`uri`, `memory_type`, `before`, `after`) |
 | `operations.deletes` | array | Deleted memories (`uri`, `memory_type`, `deleted_content`) |
+| `skipped_operations` | array | Intentionally skipped operations and their stable reason codes; these do not represent file changes |
 | `summary.total_adds` | int | Number of new memories |
 | `summary.total_updates` | int | Number of modified memories |
 | `summary.total_deletes` | int | Number of deleted memories |
+| `summary.total_skipped` | int | Number of intentionally skipped operations |
 
-An empty `memory_diff.json` (all counts zero) is written when long-term memory extraction runs but produces no memory operations.
+An empty `memory_diff.json` (all counts zero) is written when long-term memory extraction runs but produces no applied or intentionally skipped operations.
 
 <a id="built-in-memory-types"></a>
 
@@ -1454,11 +1673,11 @@ An empty `memory_diff.json` (all counts zero) is written when long-term memory e
 **Python SDK**
 
 ```python
-import openviking as ov
-from openviking.message import TextPart, ContextPart
+from openviking_sdk import AsyncHTTPClient, ContextPart, TextPart
 
 # Initialize client
-client = ov.Client(base_url="http://localhost:1933", api_key="your-key")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
 
 # Create new session
 session_result = await client.create_session()
@@ -1469,32 +1688,37 @@ print(f"Session created: {session_id}")
 await client.add_message(
     session_id=session_id,
     role="user",
-    content="How do I configure embedding?"
+    content="How do I configure embedding?",
 )
 
 # Search with session context
-results = await client.search("embedding configuration", session_id=session_id)
+results = await client.search(
+    query="embedding configuration",
+    session_id=session_id,
+)
 
 # Add assistant message with context reference
-if results.resources:
+resources = results.get("resources", [])
+if resources:
+    resource = resources[0]
     await client.add_message(
         session_id=session_id,
         role="assistant",
         parts=[
             TextPart(text="Based on the documentation, you can configure embedding..."),
             ContextPart(
-                uri=results.resources[0].uri,
+                uri=resource["uri"],
                 context_type="resource",
-                abstract=results.resources[0].abstract
-            )
-        ]
+                abstract=resource.get("abstract", ""),
+            ),
+        ],
     )
 # Commit session (returns immediately; summary + memory extraction runs in background)
-commit_result = await client.commit_session(session_id)
+commit_result = await client.commit_session(session_id=session_id)
 print(f"Task ID: {commit_result['task_id']}")
 
 # Optional: poll for completion
-task = await client.get_task(commit_result["task_id"])
+task = await client.get_task(task_id=commit_result["task_id"])
 if task and task["status"] == "completed":
     memories = task["result"]["memories_extracted"]
     total = sum(memories.values())
@@ -1551,16 +1775,16 @@ curl -X GET http://localhost:1933/api/v1/tasks/uuid-xxx \
 
 ```python
 # Commit after significant interactions
-session_info = await client.get_session(session_id)
+session_info = await client.get_session(session_id=session_id)
 if session_info["message_count"] > 10:
-    await client.commit_session(session_id)
+    await client.commit_session(session_id=session_id)
 ```
 
 ### Use Session Context for Search
 
 ```python
 # Better search results with conversation context
-results = await client.search(query, session_id=session_id)
+results = await client.search(query=query, session_id=session_id)
 ```
 
 ---

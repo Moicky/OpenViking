@@ -60,6 +60,13 @@ describe("isMemoryUri", () => {
     expect(isMemoryUri("viking://user/memories/")).toBe(true);
   });
 
+  it("accepts the ~ home alias", () => {
+    expect(isMemoryUri("viking://~/memories")).toBe(true);
+    expect(isMemoryUri("viking://~/memories/abc-123")).toBe(true);
+    expect(isMemoryUri("viking://~/peers/assistant/memories/item-1")).toBe(true);
+    expect(isMemoryUri("viking://~/skills/abc")).toBe(false);
+  });
+
   it("returns false for user skills URI", () => {
     expect(isMemoryUri("viking://user/skills/abc")).toBe(false);
   });
@@ -264,6 +271,38 @@ describe("OpenVikingClient resource and skill import", () => {
     );
   });
 
+  it("includes a response error trace_id in the thrown request error", async () => {
+    const transport = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        status: "error",
+        error: {
+          code: "INTERNAL",
+          message: "commit failed",
+          trace_id: "trace-client-error",
+        },
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933",
+      "",
+      "agent",
+      5_000,
+      "",
+      "",
+      undefined,
+      false,
+      true,
+      { transport },
+    );
+
+    await expect(client.commitSession("trace-error")).rejects.toThrow(
+      "trace_id=trace-client-error",
+    );
+  });
+
   it("uses an extended request timeout for wait=true imports", async () => {
     vi.useFakeTimers();
     const transport = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
@@ -344,6 +383,34 @@ describe("OpenVikingClient resource and skill import", () => {
       archived: true,
       task_id: "task-slow",
       memories_extracted: { core: 1 },
+    });
+  });
+
+  it("returns session commit trace_id from the response result", async () => {
+    const transport = vi.fn().mockResolvedValue(
+      okResponse({
+        session_id: "trace-session",
+        status: "accepted",
+        task_id: "task-trace",
+        archived: true,
+        trace_id: "trace-client-commit",
+      }),
+    );
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933",
+      "",
+      "agent",
+      5_000,
+      "",
+      "",
+      undefined,
+      false,
+      true,
+      { transport },
+    );
+
+    await expect(client.commitSession("trace-session")).resolves.toMatchObject({
+      trace_id: "trace-client-commit",
     });
   });
 });
@@ -504,14 +571,14 @@ describe("OpenVikingClient canonical namespace policy", () => {
       true,
       { transport },
     );
-    await client.find("test query", { targetUri: "viking://user/memories" }, "my-agent");
+    await client.find("test query", { targetUri: "viking://~/memories" }, "my-agent");
 
     const findCall = transport.mock.calls.find((c) =>
       String(c[0]).endsWith("/api/v1/search/find"),
     )!;
     const body = JSON.parse(String((findCall[1] as RequestInit).body));
     const headers = new Headers((findCall[1] as RequestInit).headers);
-    expect(body.target_uri).toBe("viking://user/memories");
+    expect(body.target_uri).toBe("viking://~/memories");
     expect(headers.get("X-OpenViking-Actor-Peer")).toBe("my-agent");
   });
 
@@ -533,14 +600,14 @@ describe("OpenVikingClient canonical namespace policy", () => {
       true,
       { transport },
     );
-    await client.find("test query", { targetUri: "viking://user/memories" }, "my-agent");
+    await client.find("test query", { targetUri: "viking://~/memories" }, "my-agent");
 
     const findCall = transport.mock.calls.find((c) =>
       String(c[0]).endsWith("/api/v1/search/find"),
     )!;
     const body = JSON.parse(String((findCall[1] as RequestInit).body));
     const headers = new Headers((findCall[1] as RequestInit).headers);
-    expect(body.target_uri).toBe("viking://user/memories");
+    expect(body.target_uri).toBe("viking://~/memories");
     expect(headers.get("X-OpenViking-Actor-Peer")).toBe("my-agent");
   });
 
@@ -562,13 +629,13 @@ describe("OpenVikingClient canonical namespace policy", () => {
       true,
       { transport },
     );
-    await client.find("test", { targetUri: "viking://user/memories" }, "shared-agent");
+    await client.find("test", { targetUri: "viking://~/memories" }, "shared-agent");
 
     const findCall = transport.mock.calls.find((c) =>
       String(c[0]).endsWith("/api/v1/search/find"),
     )!;
     const body = JSON.parse(String((findCall[1] as RequestInit).body));
-    expect(body.target_uri).toBe("viking://user/memories");
+    expect(body.target_uri).toBe("viking://~/memories");
   });
 
   it("keeps user skill target URI unchanged while using actor peer routing", async () => {
@@ -589,13 +656,13 @@ describe("OpenVikingClient canonical namespace policy", () => {
       false,
       { transport },
     );
-    await client.find("test", { targetUri: "viking://user/skills" }, "shared-agent");
+    await client.find("test", { targetUri: "viking://~/skills" }, "shared-agent");
 
     const findCall = transport.mock.calls.find((c) =>
       String(c[0]).endsWith("/api/v1/search/find"),
     )!;
     const body = JSON.parse(String((findCall[1] as RequestInit).body));
-    expect(body.target_uri).toBe("viking://user/skills");
+    expect(body.target_uri).toBe("viking://~/skills");
   });
 
   it("includes peer_id when addSessionMessage receives one", async () => {

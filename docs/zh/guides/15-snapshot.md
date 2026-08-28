@@ -129,20 +129,30 @@ data/                      # storage.workspace
 快照方法挂在 `client.snapshot.*` 命名空间下。
 
 ```python
-import openviking as ov
+from openviking_sdk import SyncHTTPClient
 
-client = ov.OpenViking()
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 client.initialize()
 
 root = "viking://resources/my_project"
 
 # 1. 写入初始内容并提交 v1
-client.write(f"{root}/guide.md", "# Guide\n\nv1 content\n", mode="create", wait=True)
+client.write(
+    uri=f"{root}/guide.md",
+    content="# Guide\n\nv1 content\n",
+    mode="create",
+    wait=True,
+)
 v1 = client.snapshot.commit(message="v1 initial import")
 print("v1:", v1["commit_oid"])
 
 # 2. 修改后再提交 v2
-client.write(f"{root}/guide.md", "# Guide\n\nv2 content\n", mode="replace", wait=True)
+client.write(
+    uri=f"{root}/guide.md",
+    content="# Guide\n\nv2 content\n",
+    mode="replace",
+    wait=True,
+)
 v2 = client.snapshot.commit(message="v2 update")
 
 # 3. 查看历史

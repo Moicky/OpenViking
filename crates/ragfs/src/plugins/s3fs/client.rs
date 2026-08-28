@@ -18,6 +18,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ENCODED_SEGMENT_PREFIX: char = '!';
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
+fn partial_delete_error(bucket: &str, errors: &[aws_sdk_s3::types::Error]) -> Option<Error> {
+    if errors.is_empty() {
+        return None;
+    }
+
+    let details = errors
+        .iter()
+        .map(|error| {
+            format!(
+                "key={} code={} message={}",
+                error.key().unwrap_or("<unknown>"),
+                error.code().unwrap_or("<unknown>"),
+                error.message().unwrap_or("<unknown>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(Error::internal(format!(
+        "S3 DeleteObjects partial failure: bucket={bucket} errors=[{details}]"
+    )))
+}
+
 fn build_s3_error_message(
     op: &str,
     scope: &str,
@@ -59,6 +81,16 @@ where
         err.request_id(),
         err.extended_request_id(),
     ))
+}
+
+fn is_s3_compatible_not_found_code<E>(err: &E) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    // AWS S3 uses the modeled NoSuchKey error; some TOS direct backends return NotFound.
+    err.code()
+        .map(|code| code == "NotFound")
+        .unwrap_or(false)
 }
 
 fn format_sdk_s3_error<E, R>(op: &str, scope: &str, sdk_err: &SdkError<E, R>) -> Error
@@ -490,7 +522,7 @@ impl S3Client {
             Ok(resp) => resp,
             Err(sdk_err) => {
                 let service_err = sdk_err.into_service_error();
-                if service_err.is_no_such_key() {
+                if service_err.is_no_such_key() || is_s3_compatible_not_found_code(&service_err) {
                     return Err(Error::NotFound(key.to_string()));
                 }
                 return Err(format_s3_service_error(
@@ -523,7 +555,7 @@ impl S3Client {
             Ok(resp) => resp,
             Err(sdk_err) => {
                 let service_err = sdk_err.into_service_error();
-                if service_err.is_no_such_key() {
+                if service_err.is_no_such_key() || is_s3_compatible_not_found_code(&service_err) {
                     return Ok(None);
                 }
                 return Err(format_s3_service_error(
@@ -570,7 +602,7 @@ impl S3Client {
             Ok(resp) => resp,
             Err(sdk_err) => {
                 let service_err = sdk_err.into_service_error();
-                if service_err.is_no_such_key() {
+                if service_err.is_no_such_key() || is_s3_compatible_not_found_code(&service_err) {
                     return Err(Error::NotFound(key.to_string()));
                 }
                 return Err(format_s3_service_error(
@@ -775,7 +807,8 @@ impl S3Client {
                     .build()
                     .map_err(|e| format_bucket_s3_error("BuildDelete", &self.bucket, e))?;
 
-                self.client
+                let response = self
+                    .client
                     .delete_objects()
                     .bucket(&self.bucket)
                     .delete(delete)
@@ -784,6 +817,9 @@ impl S3Client {
                     .map_err(|e| {
                         format_sdk_s3_error("DeleteObjects", &format!("bucket={}", self.bucket), &e)
                     })?;
+                if let Some(error) = partial_delete_error(&self.bucket, response.errors()) {
+                    return Err(error);
+                }
             }
         }
 
@@ -820,7 +856,7 @@ impl S3Client {
                 // Check if it's a 404
                 if sdk_err
                     .as_service_error()
-                    .map(|err| err.is_not_found())
+                    .map(|err| err.is_not_found() || is_s3_compatible_not_found_code(err))
                     .unwrap_or(false)
                 {
                     Ok(None)
@@ -1274,6 +1310,19 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_delete_error_reports_each_failed_key() {
+        let errors = [aws_sdk_s3::types::Error::builder()
+            .key("denied.txt")
+            .code("AccessDenied")
+            .message("denied")
+            .build()];
+
+        let error = partial_delete_error("bucket", &errors).unwrap();
+        assert!(error.to_string().contains("key=denied.txt"));
+        assert!(error.to_string().contains("code=AccessDenied"));
+    }
+
+    #[test]
     fn test_detect_content_type_for_key_uses_filename_extension() {
         assert_eq!(
             detect_content_type_for_key("tenant/docs/readme.md").as_deref(),
@@ -1344,5 +1393,32 @@ mod tests {
             }
             other => panic!("expected internal error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_is_s3_compatible_not_found_code_accepts_tos_code() {
+        let tos_not_found = FakeServiceError {
+            raw: "service error",
+            meta: ErrorMetadata::builder().code("NotFound").build(),
+        };
+        assert!(is_s3_compatible_not_found_code(&tos_not_found));
+
+        let no_such_key = FakeServiceError {
+            raw: "service error",
+            meta: ErrorMetadata::builder().code("NoSuchKey").build(),
+        };
+        assert!(!is_s3_compatible_not_found_code(&no_such_key));
+
+        let access_denied = FakeServiceError {
+            raw: "service error",
+            meta: ErrorMetadata::builder().code("AccessDenied").build(),
+        };
+        assert!(!is_s3_compatible_not_found_code(&access_denied));
+
+        let no_code = FakeServiceError {
+            raw: "service error",
+            meta: ErrorMetadata::builder().build(),
+        };
+        assert!(!is_s3_compatible_not_found_code(&no_code));
     }
 }

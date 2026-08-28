@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Extension coverage for ESM/CJS sources, and VLM image-format gating."""
 
-from openviking.parse.parsers.code.ast.extractor import _EXT_MAP
+from openviking.parse.parsers.code.ast import extract_skeleton_result
 from openviking.parse.parsers.constants import CODE_EXTENSIONS
 from openviking.parse.parsers.media.utils import _vlm_image_format
 
@@ -13,10 +13,15 @@ def test_esm_cjs_extensions_are_code():
     for ext in (".mjs", ".cjs", ".mts", ".cts"):
         assert ext in CODE_EXTENSIONS, f"{ext} missing from CODE_EXTENSIONS"
 
-    for ext in (".mjs", ".cjs"):
-        assert _EXT_MAP[ext] == "javascript"
-    for ext in (".mts", ".cts"):
-        assert _EXT_MAP[ext] == "typescript"
+    # grep_ast.filename_to_lang() returns None for .cjs/.mts/.cts, so the
+    # skeleton must come from the process engine; assert on the outcome, not
+    # on which engine produced it.
+    source = (
+        "export function foo(x) {\n  return x + 1\n}\nexport class Bar {\n  baz() { return 1 }\n}\n"
+    ) * 3
+    for ext in (".mjs", ".cjs", ".mts", ".cts"):
+        result = extract_skeleton_result(f"mod{ext}", source)
+        assert result.text and "foo" in result.text, f"no skeleton for {ext}: {result!r}"
 
 
 def test_vlm_image_format_accepts_only_what_the_api_takes():

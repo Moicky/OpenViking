@@ -26,7 +26,7 @@ class ResolveOpenVikingAssetsRequest(BaseModel):
     manifest_yaml: str = Field(min_length=1, max_length=4_000_000)
     catalog_yaml: str | None = Field(default=None, min_length=1, max_length=4_000_000)
     manifest_label: str = Field(default="manifest.yaml", min_length=1, max_length=1024)
-    catalog_label: str = Field(default="assets.yaml", min_length=1, max_length=1024)
+    catalog_label: str = Field(default="catalog.yaml", min_length=1, max_length=1024)
 
 
 class GitAuthConfig(BaseModel):
@@ -47,13 +47,14 @@ class PreflightOpenVikingAssetRequest(BaseModel):
     connector: Literal["git"]
     repo_url: str = Field(min_length=1, max_length=8192)
     branch: str | None = Field(default=None, min_length=1, max_length=1024)
+    commit: str | None = Field(default=None, min_length=1, max_length=40)
     auth_config: GitAuthConfig | None = None
 
 
 @router.post("/resolve")
 async def resolve_assets(
     request: ResolveOpenVikingAssetsRequest,
-    _ctx: RequestContext = Depends(get_request_context),
+    ctx: RequestContext = Depends(get_request_context),
 ):
     """Parse and validate configuration without submitting resources."""
 
@@ -62,6 +63,7 @@ async def resolve_assets(
         catalog_yaml=request.catalog_yaml,
         manifest_label=request.manifest_label,
         catalog_label=request.catalog_label,
+        ctx=ctx,
     )
     return response_from_result(result.model_dump())
 
@@ -78,6 +80,7 @@ async def preflight_asset(
         asset_name=request.name,
         repo_url=request.repo_url,
         branch=request.branch,
+        commit=request.commit,
         username=auth.username if auth else None,
         token=auth.token.get_secret_value() if auth and auth.token else None,
     )

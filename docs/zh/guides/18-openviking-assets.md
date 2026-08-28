@@ -31,7 +31,7 @@ OpenViking Assets 包含三个主要对象：
 - **State**：某个 Manifest 上次执行的结果，以及资产到 `viking://` 资源的映射。
 
 ```text
-manifest.yaml（使用共享 Catalog 时再加 assets.yaml）
+manifest.yaml（使用共享 Catalog 时再加 catalog.yaml）
           |
           v
 服务端解析和校验 openviking-assets/1
@@ -63,7 +63,7 @@ protocol: openviking-assets/1
 defaults:
   git:
     auth_ref: team-git
-    watch_interval: 1440
+    watch_interval: 60
 
 catalog:
   - name: openviking
@@ -122,7 +122,8 @@ Git 资产支持：
 ### 多个 Manifest 共享一个 Catalog
 
 当多个 Manifest 复用同一批资源时，把资产定义移到单独的 Catalog 文件中，通常命名为
-`assets.yaml`。Catalog 包含 `protocol`、可选的 `defaults`，以及 `assets` 下的资产定义：
+`catalog.yaml`。Catalog 包含 `protocol`、可选的 `defaults`，以及同样的 `catalog` 块——
+一份 Catalog 文件就是一个不做选择的 Manifest：
 
 ```yaml
 protocol: openviking-assets/1
@@ -130,9 +131,9 @@ protocol: openviking-assets/1
 defaults:
   git:
     auth_ref: team-git
-    watch_interval: 1440
+    watch_interval: 60
 
-assets:
+catalog:
   - name: openviking
     connector: git
     description: OpenViking 主仓库
@@ -157,12 +158,13 @@ assets:
   - requests
 ```
 
-全团队维护一份 Catalog；在 Catalog 中修改资产，所有选择它的 Manifest 都会生效。
+全团队维护一份 Catalog；在 Catalog 中修改资产，所有选择它的 Manifest 都会生效。因为两种
+文档同构，Catalog 也可以直接执行：`ov add-resource -m catalog.yaml` 会导入它定义的全部资产。
 
 CLI 按以下规则查找 Catalog 文件：
 
-1. 传入 `--catalog <file>` 时使用该路径；相对路径基于当前工作目录。
-2. 未传入时读取 Manifest 所在目录下的 `assets.yaml`。
+1. 传入 `--args catalog:<file>` 时使用该路径；相对路径基于当前工作目录。
+2. 未传入时读取 Manifest 所在目录下的 `catalog.yaml`。
 
 定义了 `catalog` 的 Manifest 不使用单独的 Catalog 文件；同时传入会导致解析失败。
 
@@ -216,10 +218,10 @@ catalog:
 先验证：
 
 ```bash
-ov add-resource --manifest manifest.yaml --dry-run
+ov add-resource --manifest manifest.yaml --args dry_run:true
 ```
 
-`--dry-run` 会完成以下操作：
+`dry_run` 会完成以下操作：
 
 - 读取本地 YAML 文件（使用单独 Catalog 文件时一并读取）；
 - 调用当前 OpenViking 服务解析并校验协议；
@@ -232,7 +234,7 @@ ov add-resource --manifest manifest.yaml --dry-run
 
 ### 应用 Manifest
 
-确认计划后去掉 `--dry-run`：
+确认计划后去掉 `dry_run`：
 
 ```bash
 ov add-resource --manifest manifest.yaml
@@ -244,7 +246,7 @@ ov add-resource --manifest manifest.yaml
 ov add-resource --manifest manifest.yaml --wait --timeout 600
 ```
 
-仓库中包含一个完整示例（含共享 Catalog 和多个 Manifest），位于
+仓库中包含一个完整示例（一份共享 Catalog 加一份按名选择的 Manifest），位于
 [`examples/openviking-assets`](https://github.com/volcengine/OpenViking/tree/main/examples/openviking-assets)。
 
 ## 凭据
@@ -273,9 +275,23 @@ export OPENVIKING_ASSETS_CREDENTIALS_FILE=/secure/path/assets-credentials.yaml
 
 执行前，CLI 会先解析所有选中资产的 `auth_ref`，然后由服务端在实际执行环境中用
 `git ls-remote` 校验每个仓库的读取权限。只要有一个别名不存在或仓库不可读，整个操作都会
-在提交任何资源之前失败；`--dry-run` 也执行相同预检。解析出的 Git 参数会通过当前配置的
-OpenViking 服务连接发送给 preflight 和资源接口，因此远程部署应使用 TLS，并限制凭据文件
-的本地访问权限。
+在提交任何资源之前失败；`dry_run` 也执行相同预检。原生 Git 凭据别名只支持 `username` 和
+`token`，并保持上述扁平结构。使用默认的原生 Git 链路时，CLI 会在调用 `add_resource` 时将它们放入
+`args.auth_config`，而 `branch` 或 `commit` 仍留在 `args` 顶层。解析出的 Git 参数会通过
+当前配置的 OpenViking 服务连接发送，因此远程部署应使用 TLS，并限制凭据文件的本地访问权限。
+
+当最终 `watch_interval` 大于 `0` 时，OpenViking 会把通过 `auth_ref` 解析出的 HTTPS Git
+token 保存到 Watch task 私有且与仓库 URL 绑定的鉴权状态中。token 不会写入 Manifest
+State、普通入库队列或 Watch API/MCP/CLI 返回。周期为 `0` 时，token 仍只在本次请求内使用。
+Git PAT 没有通用刷新流程，token 过期或被撤销后需要重建 Watch。
+
+Watch 私有状态保存在 `viking://resources/.watch_tasks.json`。启用 VikingFS 文件加密时会
+静态加密；否则服务端控制文件及其备份包含明文 token 状态。生产环境应限制服务端存储访问并
+启用加密。
+
+即使没有指定 `--wait`，原生凭据导入也需要等 clone 和 parse 完成后，服务端才会返回 task；
+因此 CLI 对这类资产默认使用 300 秒请求超时，大仓库可通过 `--timeout <秒>` 调大。token
+会放在 HTTPS 请求体中传输，生产环境应保持诊断请求体 dump 关闭。
 
 如果目标服务已经具备访问仓库所需的 SSH key 或其他认证配置，可以不设置 `auth_ref`。
 
@@ -290,7 +306,7 @@ OpenViking 服务连接发送给 preflight 和资源接口，因此远程部署�
 例如：
 
 ```text
-code-qa.yaml.state.json
+manifest.yaml.state.json
 ```
 
 State 使用 `openviking-assets-state/1` 协议，记录：
@@ -334,8 +350,9 @@ State 属于执行环境，不是 Catalog 或 Manifest 协议的一部分。共�
 ov add-resource --manifest manifest.yaml --watch-interval 60
 ```
 
-后续内容刷新由 Watch 执行，不需要周期性重新运行 Manifest。重新运行 Manifest 主要用于应用
-Catalog 或 Manifest 的构成变化、恢复失败资产，或显式触发同步。
+后续内容刷新由 Watch 执行。原生 HTTPS Git 资产使用 `auth_ref` 时，服务端会在每次刷新时
+从 Watch 私有状态恢复与仓库绑定的 token。重新运行 Manifest 仍可用于应用 Catalog/Manifest
+构成变化、恢复失败资产或显式触发同步。
 
 ## 失败处理
 
@@ -344,7 +361,7 @@ Catalog 或 Manifest 的构成变化、恢复失败资产，或显式触发同�
 1. 命令立即以原始错误码退出，例如 `PERMISSION_DENIED`；
 2. 不提交任何资产，不创建后台任务；
 3. 不写入 State；
-4. `--skip-failed` 不会跳过预检失败。
+4. `skip_failed` 不会跳过预检失败。
 
 只有全部预检成功后，才进入以下逐资产执行阶段。
 
@@ -355,62 +372,39 @@ Catalog 或 Manifest 的构成变化、恢复失败资产，或显式触发同�
 3. 已成功资产和失败记录写入 State；
 4. 命令以非零状态退出。
 
-使用 `--skip-failed` 可以继续处理其余资产：
+使用 `skip_failed` 可以继续处理其余资产：
 
 ```bash
-ov add-resource --manifest manifest.yaml --skip-failed
+ov add-resource --manifest manifest.yaml --args skip_failed:true
 ```
 
-`--skip-failed` 不会把部分失败转换为成功。只要有资产失败，命令最终仍以非零状态退出；
+`skip_failed` 不会把部分失败转换为成功。只要有资产失败，命令最终仍以非零状态退出；
 已经成功的资源不会回滚。全部资产失败时，命令会报告没有任何资产成功应用。
 
 ## 命令行选项
 
-Manifest 模式的主要参数：
+与 `--manifest` 搭配使用的参数：
 
 | 参数 | 说明 |
 | --- | --- |
 | `-m, --manifest <file>` | Manifest 文件。 |
-| `--catalog <file>` | 按名称选择资产的 Manifest 使用的单独 Catalog 文件；省略时使用 Manifest 同目录的 `assets.yaml`。Manifest 自身定义了 `catalog` 时不使用。 |
-| `--dry-run` | 解析协议并校验所有仓库的读取权限；不提交资源、不创建任务、不写 State。 |
-| `--skip-failed` | 一个资产失败后继续处理其他资产。 |
+| `--args <key:value,...>` | Manifest 运行选项，多个选项用逗号分隔，支持的键见下表。 |
 | `--wait` | 等待每个资源处理完成。 |
-| `--timeout <seconds>` | `--wait` 的超时时间。 |
+| `--timeout <seconds>` | HTTP 请求超时。原生私有 Git 即使没有 `--wait` 也会使用该值，默认 300 秒。 |
 | `--watch-interval <minutes>` | 覆盖全部资产的更新周期。 |
-| `--processing-mode <mode>` | 所有资产使用 `semantic_and_vectors` 或 `vectors_only`。 |
 
-`--to`、`--parent`、`--parent-auto-create`、`--args`、`--strict`、`--ignore-dirs`、
-`--include` 和 `--exclude` 属于单资源模式，不能与 `--manifest` 一起使用。
+`--args` 支持的运行选项：
 
-`--reason`、`--instruction`、`--no-directly-upload-media`、`--progress`、`--no-progress` 和
-`--verbose` 当前不会应用到 Manifest 中的资产，Manifest 模式下不要依赖这些参数。
+| 键 | 说明 |
+| --- | --- |
+| `catalog:<file>` | 按名称选择资产的 Manifest 使用的单独 Catalog 文件；省略时使用 Manifest 同目录的 `catalog.yaml`。Manifest 自身定义了 `catalog` 时不使用。 |
+| `dry_run:true` | 解析协议并校验所有仓库的读取权限；不提交资源、不创建任务、不写 State。 |
+| `skip_failed:true` | 一个资产失败后继续处理其他资产。 |
 
-## 结构化输出
+`--args` 既支持 `key:value,...` 逗号分隔形式，也支持整段 JSON 对象，例如
+`--args '{"dry_run": true, "catalog": "shared/catalog.yaml"}'`。
 
-默认输出适合终端阅读。使用 JSON 输出时，Manifest 模式会输出 NDJSON，即每行一个完整的
-JSON 事件，而不是一个单独的 JSON 文档：
-
-```bash
-ov --output json add-resource --manifest manifest.yaml --dry-run
-```
-
-可能出现的事件包括：
-
-- `plan`
-- `orphan`
-- `asset_preflight_start`
-- `asset_preflight_ok`
-- `asset_preflight_failed`
-- `asset_planned`
-- `asset_start`
-- `asset_done`
-- `asset_failed`
-- `asset_skipped`
-- `summary`
-
-自动化程序应逐行解析，并始终以进程退出码判断结果；执行到 `summary` 时可结合该事件。
-preflight 失败会在 `summary` 之前立即退出。注意不要假设第一行一定是 `plan`：存在 orphan
-时，`orphan` 事件会先于 `plan` 输出。
+运行选项由 CLI 在本地消费，不会作为资源参数发送给服务端；未知的键会直接报错。
 
 ## 当前限制
 

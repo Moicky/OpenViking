@@ -41,11 +41,11 @@ List directory contents.
 ```
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
 entries = client.ls(
-    "viking://resources/",
+    uri="viking://resources/",
     node_limit=200,
     sort_by="mtime",
     sort_order="desc",
@@ -138,10 +138,10 @@ Get directory tree structure.
 | level_limit | int | No | 3 | Maximum directory depth to traverse |
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
-entries = client.tree("viking://resources/")
+entries = client.tree(uri="viking://resources/")
 for entry in entries:
     type_str = "dir" if entry['isDir'] else "file"
     print(f"{entry['rel_path']} - {type_str}")
@@ -222,15 +222,15 @@ Get file or directory status information. For directories, returns the count of 
 | uri | str | Yes | - | Viking URI |
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
-info = client.stat("viking://resources/docs/api.md")
+info = client.stat(uri="viking://resources/docs/api.md")
 print(f"Size: {info['size']}")
 print(f"Is directory: {info['isDir']}")
 
 # For directories, returns item count
-dir_info = client.stat("viking://resources/docs")
+dir_info = client.stat(uri="viking://resources/docs")
 if dir_info.get('isDir'):
     print(f"Item count: {dir_info.get('count')}")
 ```
@@ -328,7 +328,7 @@ Get logical extended attributes for a file or directory.
 **Python SDK (HTTP)**
 
 ```python
-attrs = client.attrs("viking://resources/docs/api.md")
+attrs = client.attrs(uri="viking://resources/docs/api.md")
 print(attrs["attrs"]["tags"])
 ```
 
@@ -429,14 +429,14 @@ Create a directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI for the new directory |
-| description | str | No | `null` | Initial directory description. When provided, it is written to `.abstract.md` and queued for L0 vectorization. |
+| description | str | No | `null` | Initial directory description. When omitted, the directory name is used as the default L0; when provided, this description is used. Both forms write `.abstract.md` and queue L0 vectorization. |
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
-client.mkdir("viking://resources/new-project/")
-client.mkdir("viking://resources/new-project/", description="API docs directory")
+client.mkdir(uri="viking://resources/new-project/")
+client.mkdir(uri="viking://resources/new-project/", description="API docs directory")
 ```
 
 **TypeScript SDK**
@@ -506,14 +506,14 @@ Invalid URI formats, unsupported schemes, and non-public scopes return `INVALID_
 | recursive | bool | No | False | Remove directory recursively |
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
 # Remove single file
-client.rm("viking://resources/docs/old.md")
+client.rm(uri="viking://resources/docs/old.md")
 
 # Remove directory recursively
-client.rm("viking://resources/old-project/", recursive=True)
+client.rm(uri="viking://resources/old-project/", recursive=True)
 ```
 
 **TypeScript SDK**
@@ -599,12 +599,12 @@ Move file or directory.
 | to_uri | str | Yes | - | Destination Viking URI |
 
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK**
 
 ```python
 client.mv(
-    "viking://resources/old-name/",
-    "viking://resources/new-name/"
+    from_uri="viking://resources/old-name/",
+    to_uri="viking://resources/new-name/",
 )
 ```
 
@@ -662,8 +662,6 @@ openviking mv viking://resources/old-name/ viking://resources/new-name/
 ```
 
 <a id="grep"></a><a id="glob"></a>
-
-<a id="link"></a><a id="relations"></a><a id="unlink"></a>
 
 <a id="export_ovpack"></a><a id="import_ovpack"></a><a id="backup_ovpack"></a><a id="restore_ovpack"></a>
 

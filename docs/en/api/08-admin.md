@@ -59,8 +59,8 @@ Configure `root_api_key` in `~/.openviking/ovcli.conf`:
 
 ### get_agent_evolution_status
 
-Return the live instance-wide Agent Evolution switch and the configured default
-account ID. The endpoint is ROOT-only.
+Return the effective Agent Evolution switch for the caller's account. ROOT
+operates on the configured default account; ADMIN operates on its own account.
 
 **HTTP API**
 
@@ -86,8 +86,68 @@ curl http://localhost:1933/api/v1/admin/agent-evolution \
 }
 ```
 
-`enabled` is read from the live `server.agent_evolution.enabled` value used by
-session commits. `account_id` is the deployment's configured default account.
+`enabled` is the account override from
+`/local/{account_id}/_system/setting.json`, or
+`server.agent_evolution.enabled` when no override exists. Session commits read
+this effective value without restarting the server.
+
+The existing update endpoint name is unchanged:
+
+```http
+PUT /api/v1/admin/agent-evolution
+Content-Type: application/json
+
+{"enabled": true}
+```
+
+### account_settings
+
+ROOT can manage any account and ADMIN can manage only its own account. The
+generic settings endpoint accepts only explicitly allowlisted fields; currently
+only `agent_evolution.enabled` is writable.
+
+```http
+GET /api/v1/admin/accounts/{account_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/settings
+Content-Type: application/json
+
+{"agent_evolution": {"enabled": true}}
+```
+
+Before an existing setting is replaced, it is backed up to
+`/local/{account_id}/_system/setting.backup.json`.
+
+### user_settings
+
+ROOT can manage any User and ADMIN can manage Users in its own account. The
+User settings endpoint currently allowlists only `memory_policy`. The shared
+top-level `memory_types` filter controls which memory schemas may be extracted.
+User memories are routed to Self or Peer according to each message's `peer_id`;
+Agent memory types remain Self-only.
+
+```http
+GET /api/v1/admin/accounts/{account_id}/users/{user_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/users/{user_id}/settings
+Content-Type: application/json
+
+{
+  "memory_policy": {
+    "memory_types": ["profile", "preferences", "events", "entities", "experiences"]
+  }
+}
+```
+
+The response contains the User-level `memory_policy`, expanded with its default
+memory types and Agent-memory dependencies. `experiences` expands to
+`cases`, `trajectories`, and `experiences`. The policy is independent of the
+account-level Agent Evolution switch, which is managed through the dedicated
+account endpoint. Updates are backed up to the User's
+`settings/user_config.backup.json` before replacement. A Session without an
+explicit policy reads the latest User policy when it is committed; if the User
+has no override, it falls back to `server.user_config_defaults.memory_policy`
+and then to the kernel default. To clear a persisted User override and resume
+inheriting these defaults, PATCH `{"memory_policy": null}`. An empty object
+`{"memory_policy": {}}` is an explicit policy and does not clear the override.
 
 ---
 
@@ -119,14 +179,15 @@ Create a new workspace with its first admin user.
 | account_id | str | Yes | - | Workspace ID |
 | admin_user_id | str | Yes | - | First admin user ID |
 | seed | str | No | `null` | Optional deterministic API key seed. When set, the key secret is `sha256(user_id + "\0" + seed)` |
-| user_config | object | No | `null` | Initial config for the first admin user. Currently supports `add_targets.resource_uri` and `add_targets.skill_uri` |
+| user_config | object | No | `null` | Initial config for the first admin user. Supports `add_targets.resource_uri`, `add_targets.skill_uri`, and `memory_policy` |
 
 **Notes:**
 - In `trusted` mode, `user_key` is omitted from the response
 - Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
 - Account-level namespace isolation settings are no longer supported. User memory uses user-scoped namespaces, and one-to-many external participants are represented with `peer_id`.
-- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://user/resources` or `viking://user/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
-- `user_config.add_targets.skill_uri` must be `viking://user/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
+- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://~/resources` or `viking://~/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
+- `user_config.add_targets.skill_uri` must be `viking://~/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
+- Legacy spellings `viking://user/resources[/...]` and `viking://user/skills` are still accepted here and normalized to the `viking://~/...` form (the server logs an info message). Everywhere else, the uid-less spelling is rejected at the request boundary — write new configs with `viking://~/...`.
 
 #### 3. Usage Examples
 
@@ -191,18 +252,22 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_create_account("acme", "alice", seed="alice-seed")
+result = client.admin_create_account(
+    account_id="acme",
+    admin_user_id="alice",
+    seed="alice-seed",
+)
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_create_account(
-    "acme-private",
-    "alice",
+    account_id="acme-private",
+    admin_user_id="alice",
     user_config={
         "add_targets": {
-            "resource_uri": "viking://user/resources",
-            "skill_uri": "viking://user/skills",
+            "resource_uri": "viking://~/resources",
+            "skill_uri": "viking://~/skills",
         }
     },
 )
@@ -228,8 +293,8 @@ result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice",
     Seed: &seed,
     UserConfig: map[string]any{
         "add_targets": map[string]any{
-            "resource_uri": "viking://user/resources",
-            "skill_uri":    "viking://user/skills",
+            "resource_uri": "viking://~/resources",
+            "skill_uri":    "viking://~/skills",
         },
     },
 })
@@ -243,7 +308,7 @@ ov --sudo admin create-account acme --admin alice
 ov --sudo admin create-account acme --admin alice --seed alice-seed
 
 ov --sudo admin create-account acme-private --admin alice \
-  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources","skill_uri":"viking://user/skills"}}'
+  --user-config-json '{"add_targets":{"resource_uri":"viking://~/resources","skill_uri":"viking://~/skills"}}'
 ```
 
 **Response Example**
@@ -272,8 +337,10 @@ List all workspaces (ROOT only).
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges
-2. Call API Key Manager to get all accounts
-3. Return list with account ID, creation time, and user count
+2. Call API Key Manager to get all accounts (ordered lexicographically by account ID)
+3. Apply optional `name` filter
+4. Apply optional `limit`/`page` pagination
+5. Return list with account ID, creation time, and user count
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:list_accounts` - HTTP route
@@ -282,7 +349,13 @@ List all workspaces (ROOT only).
 
 #### 2. Interface and Parameters
 
-No parameters.
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| name | str | No | null | Filter by account ID (wildcard `*` and `?` matching) |
+| limit | int | No | null | Page size (≥1). Omit to return all matches |
+| page | int | No | 1 | 1-based page number; only applies when `limit` is set |
+
+Results are always returned in lexicographic order of account ID.
 
 #### 3. Usage Examples
 
@@ -293,7 +366,16 @@ GET /api/v1/admin/accounts
 ```
 
 ```bash
+# List all accounts
 curl -X GET http://localhost:1933/api/v1/admin/accounts \
+  -H "X-API-Key: <root-key>"
+
+# With filter (wildcard name matching)
+curl -X GET "http://localhost:1933/api/v1/admin/accounts?name=*acme*" \
+  -H "X-API-Key: <root-key>"
+
+# Paginated (second page of 50)
+curl -X GET "http://localhost:1933/api/v1/admin/accounts?limit=50&page=2" \
   -H "X-API-Key: <root-key>"
 ```
 
@@ -305,7 +387,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-accounts = client.admin_list_accounts()
+accounts = client.admin_list_accounts(name="*acme*", limit=50, page=1)
 for account in accounts:
     print(f"Account: {account['account_id']}, created: {account['created_at']}, users: {account['user_count']}")
 ```
@@ -313,7 +395,7 @@ for account in accounts:
 **TypeScript SDK**
 
 ```typescript
-console.log(await client.adminListAccounts());
+console.log(await client.adminListAccounts({ name: "*acme*", limit: 50, page: 1 }));
 ```
 
 **Go SDK**
@@ -331,6 +413,12 @@ fmt.Println(accounts)
 ```bash
 # Requires ROOT privileges, use --sudo
 ov --sudo admin list-accounts
+
+# Filter by wildcard name
+ov --sudo admin list-accounts --name '*acme*'
+
+# Paginated
+ov --sudo admin list-accounts --limit 50 --page 2
 ```
 
 **Response Example**
@@ -398,7 +486,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_delete_account("acme")
+result = client.admin_delete_account(account_id="acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
@@ -467,15 +555,16 @@ Register a new user in a workspace.
 | user_id | str | Yes | - | User ID |
 | role | str | No | "user" | Role to assign. `ROOT` and same-account `ADMIN` may register `"user"` or `"admin"`. ROOT identity comes only from `server.root_api_key`. |
 | seed | str | No | `null` | Optional deterministic API key seed. When set, the key secret is `sha256(user_id + "\0" + seed)` |
-| user_config | object | No | `null` | Initial config for the new user. Currently supports `add_targets.resource_uri` and `add_targets.skill_uri` |
+| user_config | object | No | `null` | Initial config for the new user. Supports `add_targets.resource_uri`, `add_targets.skill_uri`, and `memory_policy` |
 
 **Notes:**
 - In `trusted` mode, `user_key` is omitted from the response
 - Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
 - ADMIN can only register users in their own account
 - The `"root"` role cannot be minted through user registration
-- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://user/resources` or `viking://user/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
-- `user_config.add_targets.skill_uri` must be `viking://user/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
+- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://~/resources` or `viking://~/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
+- `user_config.add_targets.skill_uri` must be `viking://~/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
+- Legacy spellings `viking://user/resources[/...]` and `viking://user/skills` are still accepted here and normalized to the `viking://~/...` form (the server logs an info message). Everywhere else, the uid-less spelling is rejected at the request boundary — write new configs with `viking://~/...`.
 
 #### 3. Usage Examples
 
@@ -504,15 +593,20 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_register_user("acme", "bob", role="user", seed="bob-seed")
+result = client.admin_register_user(
+    account_id="acme",
+    user_id="bob",
+    role="user",
+    seed="bob-seed",
+)
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
 
 result = client.admin_register_user(
-    "acme",
-    "bob-private",
+    account_id="acme",
+    user_id="bob-private",
     role="user",
-    user_config={"add_targets": {"resource_uri": "viking://user/resources/project-a"}},
+    user_config={"add_targets": {"resource_uri": "viking://~/resources/project-a"}},
 )
 ```
 
@@ -535,7 +629,7 @@ seed := "bob-seed"
 result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "user", &openviking.AdminRegisterUserOptions{
     Seed: &seed,
     UserConfig: map[string]any{
-        "add_targets": map[string]any{"resource_uri": "viking://user/resources/project-a"},
+        "add_targets": map[string]any{"resource_uri": "viking://~/resources/project-a"},
     },
 })
 ```
@@ -551,7 +645,7 @@ ov admin register-user acme bob --role user --seed bob-seed
 ov --sudo admin register-user acme bob --role user
 
 ov admin register-user acme bob-private --role user \
-  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources/project-a"}}'
+  --user-config-json '{"add_targets":{"resource_uri":"viking://~/resources/project-a"}}'
 ```
 
 **Response Example**
@@ -574,13 +668,14 @@ ov admin register-user acme bob-private --role user \
 
 #### 1. API Implementation Overview
 
-List all users in a workspace.
+List active users in a workspace. Users with deletion in progress are omitted.
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges or is an ADMIN of the account
-2. Call API Key Manager to get users list
-3. Apply optional filters (name, role) and pagination limit
-4. Return users list (trusted mode omits user_key)
+2. Call API Key Manager to get active users list (ordered lexicographically by user ID)
+3. Apply optional filters (name, role)
+4. Apply optional `limit`/`page` pagination
+5. Return users list (trusted mode omits user_key)
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:list_users` - HTTP route
@@ -594,13 +689,16 @@ List all users in a workspace.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
-| limit | int | No | 100 | Maximum number of users to return |
-| name | str | No | null | Filter by user ID (prefix match) |
+| name | str | No | null | Filter by user ID (wildcard `*` and `?` matching) |
 | role | str | No | null | Filter by role |
+| limit | int | No | null | Page size (≥1). Omit to return all matches |
+| page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
 **Notes:**
+- Results are always returned in lexicographic order of user ID
 - ADMIN can only list users in their own account
 - In `trusted` mode, `user_key` is omitted from the response
+- Users whose deletion has started are no longer returned
 
 #### 3. Usage Examples
 
@@ -615,8 +713,12 @@ GET /api/v1/admin/accounts/{account_id}/users
 curl -X GET http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <root-or-admin-key>"
 
-# With filters
-curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?role=admin&limit=50" \
+# With filters (wildcard name matching)
+curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?name=*ali*&role=admin" \
+  -H "X-API-Key: <root-or-admin-key>"
+
+# Paginated (second page of 50)
+curl -X GET "http://localhost:1933/api/v1/admin/accounts/acme/users?limit=50&page=2" \
   -H "X-API-Key: <root-or-admin-key>"
 ```
 
@@ -628,7 +730,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-users = client.admin_list_users("acme")
+users = client.admin_list_users(account_id="acme", name="*ali*", limit=50, page=1)
 for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
 ```
@@ -636,7 +738,7 @@ for user in users:
 **TypeScript SDK**
 
 ```typescript
-console.log(await client.adminListUsers("account-id"));
+console.log(await client.adminListUsers("account-id", { name: "*ali*", limit: 50, page: 1 }));
 ```
 
 **Go SDK**
@@ -657,6 +759,10 @@ fmt.Println(users)
 ov admin list-users acme
 # If using root_api_key (--sudo):
 ov --sudo admin list-users acme
+# Filter by wildcard name
+ov admin list-users acme --name '*ali*'
+# Paginated
+ov admin list-users acme --limit 50 --page 2
 ```
 
 **Response Example**
@@ -679,16 +785,17 @@ ov --sudo admin list-users acme
 
 #### 1. API Implementation Overview
 
-Remove a user from a workspace. The user's API key is deleted immediately.
+Remove a user from a workspace. The user's API key is revoked immediately, and owned data cleanup runs asynchronously.
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges or is an ADMIN of the account
-2. Call API Key Manager to delete user and their API key
-3. Return deletion confirmation
+2. Write a deletion fence and revoke the user's API key
+3. Enqueue a durable cleanup task for the user's owned data
+4. Return the deletion task ID
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:remove_user` - HTTP route
-- `openviking/server/api_keys/new.py:APIKeyManager.remove_user` - Core implementation
+- `openviking/service/user_deletion.py:UserDeletionService.delete_user` - Core implementation
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. Interface and Parameters
@@ -703,6 +810,7 @@ Remove a user from a workspace. The user's API key is deleted immediately.
 **Notes:**
 - ADMIN can only remove users in their own account
 - Cannot delete the last admin user of an account
+- After deletion starts, the user key is invalid and list_users omits the user
 
 #### 3. Usage Examples
 
@@ -726,7 +834,7 @@ client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
 result = client.admin_remove_user("acme", "bob")
-print(f"User deleted: {result['deleted']}")
+print(f"User deletion task: {result['task_id']}")
 ```
 
 **TypeScript SDK**
@@ -742,7 +850,7 @@ result, err := client.AdminRemoveUser(ctx, "acme", "bob")
 if err != nil {
     return err
 }
-fmt.Println(result["deleted"])
+fmt.Println(result["task_id"])
 ```
 
 **CLI**
@@ -761,7 +869,10 @@ ov --sudo admin remove-user acme bob
 {
   "status": "ok",
   "result": {
-    "deleted": true
+    "account_id": "acme",
+    "user_id": "bob",
+    "status": "deleting",
+    "task_id": "..."
   },
   "time": 0.1
 }
@@ -822,7 +933,7 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_set_role("acme", "bob", "admin")
+result = client.admin_set_role(account_id="acme", user_id="bob", role="admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
 ```
 
@@ -920,7 +1031,11 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
+result = client.admin_regenerate_key(
+    account_id="acme",
+    user_id="bob",
+    seed="bob-new-seed",
+)
 print(f"New user key: {result['user_key']}")
 ```
 

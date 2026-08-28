@@ -164,9 +164,9 @@ class DirectoryInitializer:
     async def initialize_account_directories(self, ctx: RequestContext) -> int:
         """Initialize account-shared scope roots.
 
-        ``viking://user`` is a current-user shorthand at API boundaries. Its
-        concrete metadata belongs to ``viking://user/{user_id}`` and is created
-        by ``initialize_user_directories``.
+        ``viking://user`` is the container of user spaces, not a space itself.
+        Its concrete metadata belongs to ``viking://user/{user_id}`` and is
+        created by ``initialize_user_directories``.
         """
         count = 0
         scope_roots = {
@@ -200,7 +200,7 @@ class DirectoryInitializer:
         # still protect peer subtrees during normal filesystem mutations, but
         # it must not prevent a fresh user from creating the container that
         # owns those subtrees in the first place.
-        initialization_ctx = replace(ctx, actor_peer_id=None, legacy_agent_id=None)
+        initialization_ctx = replace(ctx, actor_peer_id=None)
         user_tree = PRESET_DIRECTORIES["user"]
         parent_uri = "viking://user"
         count = 0

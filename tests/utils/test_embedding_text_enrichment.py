@@ -14,8 +14,8 @@ def test_prefixes_repo_relative_path():
     assert text.endswith("export const sendMessage = ...")
 
 
-def test_empty_body_returns_path_only():
-    assert build_embedding_text("viking://resources/r/a.ts", "") == "resources/r/a.ts"
+def test_empty_body_stays_empty_so_nothing_is_enqueued():
+    assert build_embedding_text("viking://resources/r/a.ts", "") == ""
 
 
 def test_plain_path_without_scheme():

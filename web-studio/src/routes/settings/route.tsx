@@ -8,6 +8,7 @@ import {
   ExternalLinkIcon,
   KeyRoundIcon,
   ShieldCheckIcon,
+  TriangleAlertIcon,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
@@ -27,6 +28,7 @@ import type { CapabilityProbeResult } from '#/lib/admin'
 import { DEFAULT_ACCOUNT_ID, DEFAULT_USER_ID } from '#/lib/admin-options'
 import { PLAIN_INPUT_PROPS } from '#/lib/form-input'
 import { cn } from '#/lib/utils'
+import { localizeCapabilityDetail } from './-lib/localize-capability-probe'
 import type { ConnectionDraft } from '#/hooks/use-app-connection'
 
 export const Route = createFileRoute('/settings')({
@@ -57,6 +59,7 @@ function CapabilityStatus({
 }) {
   const { t } = useTranslation('settings')
   const state = isLoading ? 'checking' : result?.state || 'skipped'
+  const detail = localizeCapabilityDetail(result, t)
 
   return (
     <div
@@ -76,9 +79,9 @@ function CapabilityStatus({
             {t(`health.state.${state}`)}
           </span>
         </div>
-        {result?.detail ? (
+        {detail ? (
           <p className="mt-1 truncate text-xs text-muted-foreground">
-            {result.detail}
+            {detail}
           </p>
         ) : null}
       </div>
@@ -192,6 +195,7 @@ function ConnectionSettingsRoute() {
     staleTime: 15_000,
   })
   const isDevMode = serverMode === 'dev'
+  const isUnsupportedAuthMode = serverMode === 'oidc' || serverMode === 'ldap'
   const rootApiKey = connection.adminApiKey.trim()
   const hasControlCredential = Boolean(draft.adminApiKey.trim())
   const hasDataCredential = Boolean(draft.apiKey.trim())
@@ -283,6 +287,35 @@ function ConnectionSettingsRoute() {
             <p className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
               {t('connection.devMode')}
             </p>
+          ) : isUnsupportedAuthMode ? (
+            <Alert variant="destructive" className="border-destructive/50">
+              <TriangleAlertIcon className="size-5" />
+              <AlertTitle>
+                {t('connection.unsupportedAuthMode.title')}
+              </AlertTitle>
+              <AlertDescription className="grid gap-2">
+                <p>
+                  {t('connection.unsupportedAuthMode.primary', {
+                    mode: serverMode,
+                  })}
+                </p>
+                <p>
+                  {t('connection.unsupportedAuthMode.description', {
+                    mode: serverMode,
+                    ov: 'ov',
+                  })}
+                </p>
+                <a
+                  href={authenticationGuideUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-flex w-fit items-center gap-1 font-medium text-foreground underline underline-offset-2"
+                >
+                  {t('connection.keyGuide.learnMore')}
+                  <ExternalLinkIcon className="size-3.5" />
+                </a>
+              </AlertDescription>
+            </Alert>
           ) : (
             <>
               <div className="grid gap-4 md:grid-cols-2">
