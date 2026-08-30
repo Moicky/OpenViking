@@ -11,6 +11,7 @@ via api_key + api_base configuration.
 from typing import Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from openviking.models.rerank.base import RerankBase
 from openviking_cli.utils import get_logger
@@ -20,6 +21,11 @@ logger = get_logger(__name__)
 # DashScope native API paths that use a nested request/response envelope.
 # The OpenAI-compatible endpoint (/compatible-api/) uses the flat protocol.
 _DASHSCOPE_NATIVE_PATH_MARKERS = ("/api/v1/services/rerank",)
+
+
+# Above the retriever's observed peak rerank fan-out (~9 concurrent) with room
+# to spare; urllib3 warns and discards connections when the pool is undersized.
+_CONNECTION_POOL_SIZE = 32
 
 
 def _uses_nested_envelope(api_base: str) -> bool:
@@ -71,6 +77,17 @@ class OpenAIRerankClient(RerankBase):
         self.timeout = timeout
         self.provider = "openai"
         self._uses_nested_envelope = _uses_nested_envelope(api_base)
+
+        # Reuse connections across calls. One retrieval issues dozens of rerank
+        # requests, and against a hosted endpoint a fresh TCP+TLS handshake per
+        # call costs ~80ms of the ~300ms round trip -- measured flat regardless
+        # of how many documents the call carries, i.e. it is connection setup,
+        # not inference. The pool is sized above the retriever's fan-out so
+        # concurrent calls do not queue waiting for a free connection.
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=_CONNECTION_POOL_SIZE)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
     def _build_request_body(self, query: str, documents: List[str]) -> dict:
         """Build the request body for the rerank API.
@@ -140,7 +157,7 @@ class OpenAIRerankClient(RerankBase):
             if self.extra_headers:
                 headers.update(self.extra_headers)
 
-            response = requests.post(
+            response = self._session.post(
                 url=self.api_base,
                 headers=headers,
                 json=req_body,

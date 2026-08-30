@@ -169,7 +169,7 @@ class TestRerankBatch:
             "request_id": "abc123",
         }
 
-        with patch("openviking.models.rerank.openai_rerank.requests.post", return_value=mock_response) as mock_post:
+        with patch("openviking.models.rerank.openai_rerank.requests.Session.post", return_value=mock_response) as mock_post:
             scores = client.rerank_batch("hello", ["doc1", "doc2"])
 
         assert scores == [0.95, 0.12]
@@ -203,7 +203,7 @@ class TestRerankBatch:
             ]
         }
 
-        with patch("openviking.models.rerank.openai_rerank.requests.post", return_value=mock_response) as mock_post:
+        with patch("openviking.models.rerank.openai_rerank.requests.Session.post", return_value=mock_response) as mock_post:
             scores = client.rerank_batch("hello", ["doc1", "doc2"])
 
         assert scores == [0.88, 0.42]
@@ -234,7 +234,7 @@ class TestRerankBatch:
             ]
         }
 
-        with patch("openviking.models.rerank.openai_rerank.requests.post", return_value=mock_response) as mock_post:
+        with patch("openviking.models.rerank.openai_rerank.requests.Session.post", return_value=mock_response) as mock_post:
             scores = client.rerank_batch("hello", ["doc1", "doc2"])
 
         assert scores == [0.88, 0.42]
@@ -264,7 +264,7 @@ class TestRerankBatch:
             }
         }
 
-        with patch("openviking.models.rerank.openai_rerank.requests.post", return_value=mock_response):
+        with patch("openviking.models.rerank.openai_rerank.requests.Session.post", return_value=mock_response):
             scores = client.rerank_batch("hello", ["doc1", "doc2"])
 
         assert scores == [0.77, 0.33]
@@ -295,7 +295,7 @@ class TestRerankBatch:
             ]
         }
 
-        with patch("openviking.models.rerank.openai_rerank.requests.post", return_value=mock_response):
+        with patch("openviking.models.rerank.openai_rerank.requests.Session.post", return_value=mock_response):
             scores = client.rerank_batch("hello", ["doc0", "doc1", "doc2"])
 
         assert scores == [0.0, 0.55, 0.0]
