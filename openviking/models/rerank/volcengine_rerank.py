@@ -7,10 +7,11 @@ Provides rerank functionality for hierarchical retrieval.
 """
 
 import json
+import threading
 
 # For logging, use Python's built-in logging
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from volcengine.auth.SignerV4 import SignerV4
@@ -21,6 +22,27 @@ from openviking.models.rerank.base import RerankBase
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+_CLIENT_CACHE: Dict[tuple, Any] = {}
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
+def _client_cache_key(config) -> tuple:
+    """Identity of a rerank client: everything that changes where/how it calls."""
+    return (
+        config._effective_provider(),
+        getattr(config, "api_base", None),
+        getattr(config, "model", None),
+        getattr(config, "model_name", None),
+        getattr(config, "model_version", None),
+        getattr(config, "api_key", None),
+        getattr(config, "ak", None),
+        getattr(config, "sk", None),
+        getattr(config, "host", None),
+        getattr(config, "timeout", None),
+        tuple(sorted((getattr(config, "extra_headers", None) or {}).items())),
+    )
 
 
 class RerankClient(RerankBase):
@@ -191,10 +213,13 @@ class RerankClient(RerankBase):
     @classmethod
     def from_config(cls, config) -> Optional["RerankClient"]:
         """
-        Create RerankClient from RerankConfig.
+        Create RerankClient from RerankConfig, reusing one client per config.
 
-        Args:
-            config: RerankConfig instance
+        A HierarchicalRetriever is built per search and builds its rerank client
+        in __init__, so without this cache every search got a fresh client -- and
+        with it a fresh HTTP connection pool, making every rerank call pay a cold
+        TCP+TLS handshake (~80ms of a ~300ms round trip). Keying on the config's
+        own values means a changed ov.conf still yields a new client.
 
         Returns:
             RerankClient instance or None if config is not available
@@ -202,6 +227,22 @@ class RerankClient(RerankBase):
         if not config or not config.is_available():
             return None
 
+        cache_key = _client_cache_key(config)
+        with _CLIENT_CACHE_LOCK:
+            cached = _CLIENT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        client = cls._build_from_config(config)
+
+        with _CLIENT_CACHE_LOCK:
+            # Another thread may have built one first; prefer the cached instance
+            # so a single pool is shared rather than two competing ones.
+            return _CLIENT_CACHE.setdefault(cache_key, client)
+
+    @classmethod
+    def _build_from_config(cls, config) -> Optional["RerankClient"]:
+        """Construct the provider-specific client for this config."""
         provider = config._effective_provider()
 
         if provider == "cohere":
