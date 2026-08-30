@@ -534,18 +534,41 @@ class HierarchicalRetriever:
             )
 
             telemetry = get_current_telemetry()
-            for (_, current_score), results in zip(batch, batch_results, strict=True):
+
+            # Score the whole batch concurrently. The searches above already fan
+            # out MAX_PARALLEL_CHILD_SEARCHES-wide, but reranking each result set
+            # in the consuming loop put the rerank calls back in series. That is
+            # invisible with a local reranker (~0.03s/call) and dominates the
+            # request with a hosted one (~0.29s/call over the network), where one
+            # recall issues dozens of calls. The calls are independent, so
+            # gathering them changes latency only, not scores.
+            batch_scores = [
+                [self._finite_score(r.get("_score", 0.0)) for r in results]
+                for results in batch_results
+            ]
+            if self._rerank_client and mode == RetrieverMode.THINKING:
+                batch_scores = list(
+                    await asyncio.gather(
+                        *(
+                            self._rerank_scores(
+                                query,
+                                [str(r.get("abstract", "")) for r in results],
+                                scores,
+                            )
+                            for results, scores in zip(batch_results, batch_scores, strict=True)
+                        )
+                    )
+                )
+
+            for (_, current_score), results, query_scores in zip(
+                batch, batch_results, batch_scores, strict=True
+            ):
                 telemetry.count("vector.searches", 1)
                 telemetry.count("vector.scored", len(results))
                 telemetry.count("vector.scanned", len(results))
 
                 if not results:
                     continue
-
-                query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
-                if self._rerank_client and mode == RetrieverMode.THINKING:
-                    documents = [str(r.get("abstract", "")) for r in results]
-                    query_scores = await self._rerank_scores(query, documents, query_scores)
 
                 for r, score in zip(results, query_scores, strict=True):
                     uri = r.get("uri", "")
@@ -673,9 +696,7 @@ class HierarchicalRetriever:
                     category=c.get("category", ""),
                     score=final_score,
                     signals=signals,
-                    search_tags=normalize_search_tags(
-                        c.get("search_tags"), discard_invalid=True
-                    ),
+                    search_tags=normalize_search_tags(c.get("search_tags"), discard_invalid=True),
                 )
             )
 

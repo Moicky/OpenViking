@@ -757,3 +757,82 @@ async def test_thinking_mode_reaches_files_when_intermediate_dirs_are_unindexed(
         f"got {uris}"
     )
     assert result.matched_contexts[0].context_type == ContextType.MEMORY
+
+
+class ConcurrencyProbeRerankClient:
+    """Records how many rerank calls are in flight at once.
+
+    ``_rerank_scores`` dispatches through ``asyncio.to_thread``, so real
+    concurrency shows up as overlapping calls on worker threads.
+    """
+
+    def __init__(self, hold_seconds: float = 0.05):
+        self._hold = hold_seconds
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.max_in_flight = 0
+        self.calls = 0
+
+    def rerank_batch(self, query: str, documents: list[str]):
+        with self._lock:
+            self._in_flight += 1
+            self.calls += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            time.sleep(self._hold)
+            return [0.5] * len(documents)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+class WideTreeStorage(DummyStorage):
+    """A root whose children are directories, each with its own children.
+
+    Descending it makes the retriever rerank several sibling result sets in the
+    same batch, which is where the calls used to serialize.
+    """
+
+    ROOTS = [f"viking://resources/dir{i}" for i in range(4)]
+
+    async def search_in_tenant(self, ctx, level=None, **kwargs):
+        if level and set(level) <= {0, 1}:
+            return [_result(uri, 0.9, level=1) for uri in self.ROOTS]
+        return []
+
+    async def search_children_in_tenant(self, ctx, parent_uri: str, **kwargs):
+        self.child_search_calls.append({"parent_uri": parent_uri})
+        if parent_uri in self.ROOTS:
+            return [_result(f"{parent_uri}/file{i}.md", 0.8, abstract="body") for i in range(3)]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_sibling_rerank_calls_run_concurrently(monkeypatch):
+    """Reranks within one descent batch must overlap, not serialize.
+
+    With a hosted reranker each call is a network round trip, so serializing
+    the batch multiplies the whole request's latency by the fan-out width.
+    """
+    probe = ConcurrencyProbeRerankClient()
+    monkeypatch.setattr(
+        "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
+        lambda config: probe,
+    )
+    retriever = HierarchicalRetriever(
+        storage=WideTreeStorage(), embedder=DummyEmbedder(), rerank_config=_config()
+    )
+
+    await retriever.retrieve(
+        TypedQuery(query="hello", context_type=None, intent="", target_directories=[]),
+        ctx=_ctx(),
+        limit=10,
+        mode=RetrieverMode.THINKING,
+        score_threshold=0.0,
+    )
+
+    assert probe.calls > 1, "test tree should trigger several rerank calls"
+    assert probe.max_in_flight > 1, (
+        "sibling rerank calls serialized; expected overlap within a descent batch "
+        f"(calls={probe.calls}, max_in_flight={probe.max_in_flight})"
+    )
