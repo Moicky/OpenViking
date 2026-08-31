@@ -4,6 +4,8 @@ import {
 } from '../-constants/dashboard'
 import type {
   ConsoleContextCommitItem,
+  ConsoleMemoryUnusedItem,
+  ConsoleMemoryUsageItem,
   ConsoleTokenSeriesItem,
 } from '@ov-server/api/v1/console'
 import type { CommitHeatmapStats, HeatMapDayValue } from '../-types/dashboard'
@@ -170,4 +172,47 @@ export function normalizeCommitItems(
         addResource + addSkill + sessionAddMessage + sessionCommit,
     }
   })
+}
+
+export function normalizeMemoryUsage(
+  items: unknown,
+): Array<Required<ConsoleMemoryUsageItem>> {
+  return asArray(items).map((raw) => {
+    const record = asRecord(raw)
+    const injected = asNumber(record.injected)
+    const found = asNumber(record.found)
+    const read = asNumber(record.read)
+    return {
+      active_days: asNumber(record.active_days),
+      category: asString(record.category) || 'memories',
+      first_date: asString(record.first_date),
+      found,
+      injected,
+      last_access_at: asString(record.last_access_at),
+      read,
+      total: asNumber(record.total) || injected + found + read,
+      uri: asString(record.uri),
+    }
+  })
+}
+
+export function normalizeMemoryUnused(
+  items: unknown,
+): Array<ConsoleMemoryUnusedItem> {
+  return asArray(items).map((raw) => {
+    const record = asRecord(raw)
+    return {
+      category: asString(record.category) || 'memories',
+      created_at: asString(record.created_at) || null,
+      updated_at: asString(record.updated_at) || null,
+      uri: asString(record.uri),
+    }
+  })
+}
+
+// A viking:// URI is mostly namespace scaffolding; the leaf and its category
+// folder are what a reader can actually recognise in a list.
+export function memoryUriLabel(uri: string): string {
+  const parts = uri.split('/').filter(Boolean)
+  return parts.slice(-2).join('/') || uri
 }

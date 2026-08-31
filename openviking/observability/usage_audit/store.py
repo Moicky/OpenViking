@@ -73,6 +73,15 @@ class UsageAuditStore(Protocol):
     ) -> list[dict[str, Any]]:
         """Return context write bucket rows for a viewer-local date range and user scope."""
 
+    async def get_memory_usage(
+        self,
+        *,
+        account_id: str,
+        user_id: str | None = None,
+        days: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Return per-URI access rollups for self-learned memories."""
+
     async def query_audit_logs(
         self,
         *,

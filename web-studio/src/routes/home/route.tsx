@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 
 import { ContextCommitsPanel } from './-components/context-commits-panel'
+import { MemoryUsagePanel } from './-components/memory-usage-panel'
 import {
   ContextDataPanel,
   TodayRetrievalsPanel,
@@ -12,6 +13,7 @@ import { TokenTrendPanel } from './-components/token-trend-panel'
 import {
   fetchConsoleContextCommits,
   fetchConsoleDashboardSummary,
+  fetchConsoleMemoryUsage,
   fetchConsoleTokenSeries,
 } from './-lib/api'
 import { isDisabledPayload } from './-lib/format'
@@ -75,6 +77,13 @@ function HomePage() {
     refetchInterval: 60_000,
   })
 
+  const memoryUsage = useQuery({
+    enabled: canQueryMetrics,
+    queryFn: fetchConsoleMemoryUsage,
+    queryKey: ['console-memory-usage', metricsScopeKey],
+    refetchInterval: 60_000,
+  })
+
   const contextCommits = useQuery({
     enabled: canQueryMetrics,
     queryFn: fetchConsoleContextCommits,
@@ -92,6 +101,7 @@ function HomePage() {
   const isMetricsLoading = isConnectionRoleLoading || dashboard.isLoading
   const isSeriesLoading = isConnectionRoleLoading || tokenSeries.isLoading
   const isCommitsLoading = isConnectionRoleLoading || contextCommits.isLoading
+  const isMemoryUsageLoading = isConnectionRoleLoading || memoryUsage.isLoading
 
   return (
     <div className="flex flex-col gap-5 pb-8">
@@ -128,6 +138,15 @@ function HomePage() {
         disabledMessage={unavailableMessage}
         isError={tokenSeries.isError}
         isLoading={isSeriesLoading}
+        t={t}
+      />
+
+      <MemoryUsagePanel
+        data={memoryUsage.data}
+        disabled={metricsUnavailable}
+        disabledMessage={unavailableMessage}
+        isError={memoryUsage.isError}
+        isLoading={isMemoryUsageLoading}
         t={t}
       />
 

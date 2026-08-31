@@ -72,6 +72,7 @@ async def init_usage_audit_from_server_config(
     store = SQLiteUsageAuditStore(
         _resolve_sqlite_path(config),
         usage_retention_days=usage_config.usage_retention_days,
+        memory_retention_days=usage_config.memory_retention_days,
         audit_retention_days=usage_config.audit_retention_days,
         audit_retention_per_account=usage_config.audit_retention_per_account,
     )

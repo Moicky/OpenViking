@@ -597,3 +597,67 @@ async def test_no_relevant_digest_keeps_uris_out_of_the_dedup_ledger(monkeypatch
     assert result.rendered == ""
     assert len(result.entries) == 1
     assert recorded == []
+
+
+async def test_assembly_publishes_injection_events_for_served_memories():
+    """Recall accounting fires from the same `served` set the ledger records."""
+    from openviking.observability.events import (
+        register_event_subscriber,
+        unregister_event_subscriber,
+    )
+
+    hits = [
+        {"uri": f"{USER_ROOT}/memories/entities/a.md", "score": 0.62, "abstract": "abs a"},
+        {"uri": f"{USER_ROOT}/memories/preferences/b.md", "score": 0.55, "abstract": "abs b"},
+    ]
+    seen = []
+    register_event_subscriber("test-memory-access", seen.append)
+    try:
+        result = await assemble_context(
+            service=_service(hits=hits, bodies={}),
+            ctx=_ctx(),
+            params=AssembleParams(query="what changed", max_tokens=1600),
+        )
+    finally:
+        unregister_event_subscriber("test-memory-access")
+
+    assert len(result.entries) == 2
+    events = [event for event in seen if event.event_name == "memory.access"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["source"] == "injected"
+    assert payload["account_id"] == _ctx().account_id
+    assert {entry["uri"] for entry in payload["entries"]} == {
+        f"{USER_ROOT}/memories/entities/a.md",
+        f"{USER_ROOT}/memories/preferences/b.md",
+    }
+    assert {entry["category"] for entry in payload["entries"]} == {"entities", "preferences"}
+
+
+async def test_assembly_publishes_nothing_when_digest_reports_no_relevant(monkeypatch):
+    """A blanked digest served nothing, so nothing may be counted as used."""
+    from openviking.observability.events import (
+        register_event_subscriber,
+        unregister_event_subscriber,
+    )
+
+    async def fake_rewrite(*, query, rendered, max_bullets, valid_uris):
+        del query, rendered, max_bullets, valid_uris
+        return "", "no_relevant", None
+
+    monkeypatch.setattr(pipeline_module, "rewrite_context", fake_rewrite)
+    monkeypatch.setattr(pipeline_module, "server_rewrite_enabled", lambda _: True)
+
+    hits = [{"uri": f"{USER_ROOT}/memories/entities/a.md", "score": 0.62, "abstract": "abs a"}]
+    seen = []
+    register_event_subscriber("test-memory-access", seen.append)
+    try:
+        await assemble_context(
+            service=_service(hits=hits, bodies={}),
+            ctx=_ctx(),
+            params=AssembleParams(query="what changed", max_tokens=1600),
+        )
+    finally:
+        unregister_event_subscriber("test-memory-access")
+
+    assert [event for event in seen if event.event_name == "memory.access"] == []

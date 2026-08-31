@@ -1,5 +1,7 @@
 export const TOKEN_SERIES_DAYS = 14
 export const COMMIT_SERIES_DAYS = 365
+export const MEMORY_USAGE_DAYS = 30
+export const MEMORY_USAGE_LIMIT = 8
 
 export const TOKEN_COLORS = {
   embedding: 'oklch(0.5 0.11 252)',

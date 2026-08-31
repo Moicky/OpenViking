@@ -3,13 +3,20 @@ import {
   getConsoleDashboardSummary,
   getConsoleTokens,
   getOvResult,
+  ovClient,
 } from '#/lib/ov-client'
 
-import { COMMIT_SERIES_DAYS, TOKEN_SERIES_DAYS } from '../-constants/dashboard'
+import {
+  COMMIT_SERIES_DAYS,
+  MEMORY_USAGE_DAYS,
+  MEMORY_USAGE_LIMIT,
+  TOKEN_SERIES_DAYS,
+} from '../-constants/dashboard'
 import type {
   ConsoleSeriesQuery,
   ConsoleContextCommitsResult,
   ConsoleDashboardSummaryResult,
+  ConsoleMemoryUsageResult,
   ConsoleTokenSeriesResult,
 } from '@ov-server/api/v1/console'
 import { getLastDaysRange, getViewerTimezone } from './format'
@@ -43,5 +50,18 @@ export function fetchConsoleContextCommits(): Promise<ConsoleContextCommitsResul
   }
   return getOvResult<ConsoleContextCommitsResult>(
     getConsoleContextCommits({ query }),
+  )
+}
+
+// ponytail: hand-rolled because the endpoint post-dates the last
+// `pnpm gen-server-client` run, which needs a live server. Fold it into
+// sdk.gen.ts at the next regeneration.
+export function fetchConsoleMemoryUsage(): Promise<ConsoleMemoryUsageResult> {
+  return getOvResult<ConsoleMemoryUsageResult>(
+    ovClient.client.get({
+      query: { days: MEMORY_USAGE_DAYS, limit: MEMORY_USAGE_LIMIT },
+      responseType: 'json',
+      url: '/api/v1/console/memory-usage',
+    }),
   )
 }

@@ -9,6 +9,7 @@ API 请求链路里同步写统计库。
 当前模块主要服务 Console P0 页面：
 
 - 总览页首屏：上下文数据量、今日 Token、今日检索、Agent 概览
+- 记忆使用情况：自学习记忆的注入/读取次数排行，以及从未被使用的清理候选
 - Token 趋势：按日期范围查询模型 Token 消耗
 - 上下文提交热力图：按日期和小时段查询上下文写入活动
 - 请求日志：分页查询请求明细、状态、耗时和成功率
@@ -67,6 +68,7 @@ Observability Event Bus
         "flush_interval_seconds": 1.0,
         "shutdown_flush_timeout_seconds": 3.0,
         "usage_retention_days": 14,
+        "memory_retention_days": 90,
         "audit_retention_days": 7,
         "audit_retention_per_account": 1000,
         "timezone": "local",
@@ -89,6 +91,7 @@ Observability Event Bus
 | `flush_interval_seconds` | `1.0` | worker 定时 flush 间隔 |
 | `shutdown_flush_timeout_seconds` | `3.0` | 服务关闭时 flush 等待时间 |
 | `usage_retention_days` | `14` | 统计聚合数据保留天数，包含 Token、检索、上下文写入热力图、Agent 活跃；`0` 表示不按天裁剪 |
+| `memory_retention_days` | `90` | 记忆访问数据保留天数；窗口比其他统计长，因为“哪些记忆可以清理”是按月判断的；`0` 表示不按天裁剪 |
 | `audit_retention_days` | `7` | 请求审计日志保留天数；`0` 表示不按天裁剪 |
 | `audit_retention_per_account` | `1000` | 每个 account 保留的最新请求审计条数；`0` 表示不按条数裁剪 |
 | `timezone` | `"local"` | Console 请求未传 `timezone` 时的兜底查询时区；写入始终按 UTC 保存。`"local"` 表示 server 进程所在机器/容器的本地时区 |
@@ -146,6 +149,28 @@ vector filter，也不从历史写入事件累计当前库存。
 
 这部分会走 `inventory_ttl_seconds` 缓存，避免 Console 刷新频繁打到底层存储。业务根目录
 不存在时按 0 处理，避免新环境或空租户反复刷 warning。
+
+### 记忆使用情况
+
+来自 `memory.access` 事件，按 `(account, user, UTC 日期, uri, source)` 聚合到
+`memory_access_daily`：
+
+| source | 来源 | 含义 |
+| --- | --- | --- |
+| `injected` | `assemble_context` 实际下发的条目（`/search` mode=`context`、`/recall`） | 服务端组装的上下文块中包含该记忆 |
+| `found` | `POST /api/v1/search/find`、`POST /api/v1/search/search`（非 context 模式）返回的 `memories` / `skills` 命中 | 客户端自行组装上下文的插件只有这一条路径；Agent 主动 `find` 也计入 |
+| `read` | `GET /api/v1/content/{read,abstract,overview}` | 调用方显式读取该记忆 |
+
+`found` 是必要的：早于服务端上下文组装的 harness 插件（例如 `openviking-memory` 0.4.3）
+只调用 `find` 然后在客户端拼装注入块，服务端无法从别处得知哪些记忆进了那个会话。
+它的证据强度弱于 `injected`，因此三者分列存储、分别展示，而不是合并成一个计数。
+
+只统计**自学习**内容：URI 位于 `.../memories/<category>/…` 或 `.../skills/…`。
+已索引资源（`viking://resources/...`，以及资源根目录下自带的 `skills/`、`memories/`
+子目录）一律不计入，否则一次仓库导入就会淹没自学习知识的使用信号。
+
+`injected` 与去重 ledger 使用同一份 `served` 集合：当 digest 判定 `no_relevant`
+把上下文块清空时，这一轮不会计入任何一条记忆。
 
 ### 请求审计
 
@@ -289,6 +314,61 @@ GET /api/v1/console/context-commits?start_date=2026-05-01&end_date=2026-05-12&bu
 
 返回中会补齐日期和小时段范围内没有数据的 bucket。
 
+### Memory Usage
+
+```text
+GET /api/v1/console/memory-usage?days=30&limit=10
+```
+
+参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `days` | 否 | 回溯天数，`0..365`，默认 `30`；`0` 表示全部保留期 |
+| `limit` | 否 | `top` 与 `unused` 各自返回的条数，`1..100`，默认 `10` |
+
+返回示例：
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "days": 30,
+    "totals": {
+      "inventory": 42,
+      "used": 18,
+      "unused": 24,
+      "deleted_but_used": 0,
+      "injections": 137,
+      "found": 214,
+      "reads": 9,
+      "accesses": 360
+    },
+    "by_category": { "entities": 61, "events": 40 },
+    "top": [
+      {
+        "uri": "viking://user/u1/memories/entities/foo.md",
+        "category": "entities",
+        "injected": 23,
+        "found": 31,
+        "read": 2,
+        "total": 56,
+        "active_days": 11,
+        "first_date": "2026-08-04",
+        "last_access_at": "2026-08-31T09:12:44+00:00"
+      }
+    ],
+    "unused": [
+      { "uri": "viking://user/u1/memories/events/old.md", "category": "events" }
+    ]
+  }
+}
+```
+
+`unused` 来自向量库中当前存在的自学习条目减去窗口内有访问记录的 URI，因此它回答的是
+“哪些记忆可以清理”。`deleted_but_used` 是有访问记录但当前库存里已不存在的条目数——它们
+计入 totals，但不是清理候选。
+
 ### Audit Logs
 
 ```text
@@ -365,6 +445,7 @@ curl "http://127.0.0.1:1933/api/v1/console/dashboard/summary" \
   tests/observability/test_usage_audit_store.py \
   tests/observability/test_usage_audit_worker.py \
   tests/observability/test_console_router.py \
+  tests/observability/test_memory_access.py \
   tests/observability/test_usage_audit_runtime.py \
   tests/observability/test_usage_audit_inventory.py \
   tests/misc/test_console_proxy.py

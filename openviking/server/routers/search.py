@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
+from openviking.observability.memory_access import publish_memory_access
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
 from openviking.retrieve.context_assembler import (
     CATEGORY_KEYS,
@@ -61,6 +62,31 @@ def _sanitize_floats(obj: Any) -> Any:
 
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
 TimeField = Literal["updated_at", "created_at"]
+
+
+def _record_found_memories(result: Any, ctx: RequestContext) -> None:
+    """Count self-learned hits handed back to a caller that assembles its own block.
+
+    Harness plugins that predate server-side context assembly fan out over
+    `find` and build the injected block themselves, so this is the only place
+    the server sees which memories reached that session. Resource hits are
+    dropped downstream by URI, which is what keeps a repo search out of it.
+    """
+    if not isinstance(result, dict):
+        return
+    hits = [
+        hit
+        for bucket in ("memories", "skills")
+        for hit in (result.get(bucket) or [])
+        if isinstance(hit, dict)
+    ]
+    if hits:
+        publish_memory_access(
+            source="found",
+            entries=hits,
+            account_id=ctx.account_id,
+            user_id=getattr(getattr(ctx, "user", None), "user_id", None),
+        )
 
 
 def _resolve_search_limit(limit: int, node_limit: Optional[int]) -> int:
@@ -357,6 +383,7 @@ async def find(
         result = result.to_dict(include_provenance=request.include_provenance)
     if request.read_content:
         result = await _inline_read_content(result, service=service, ctx=_ctx)
+    _record_found_memories(result, _ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",
@@ -476,6 +503,7 @@ async def search(
         result = result.to_dict(include_provenance=request.include_provenance)
     if request.read_content:
         result = await _inline_read_content(result, service=service, ctx=_ctx)
+    _record_found_memories(result, _ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",

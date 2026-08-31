@@ -118,6 +118,69 @@ class UsageAuditQueryService:
         )
         return {"start_date": start_date, "end_date": end_date, "bucket": bucket, "items": items}
 
+    async def memory_usage(
+        self,
+        *,
+        ctx: RequestContext,
+        days: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Rank self-learned memories by how often a session actually used one.
+
+        `top` answers "what is carrying its weight"; `unused` answers "what can
+        be cleaned up". Both come from the same window so the two lists always
+        add up to the tracked inventory.
+        """
+        user_id = self._usage_user_id(ctx)
+        rows = await self._store.get_memory_usage(
+            account_id=ctx.account_id, user_id=user_id, days=days
+        )
+        by_uri = {str(row["uri"]): row for row in rows}
+        inventory = await self._inventory.list_memory_records(ctx)
+
+        # An access row whose memory has since been deleted still counts toward
+        # the totals, but it is not a cleanup candidate — it is already gone.
+        known = {item["uri"] for item in inventory}
+        unused = [
+            {
+                "uri": item["uri"],
+                "category": item["category"],
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+            }
+            for item in inventory
+            if item["uri"] not in by_uri
+        ]
+        unused.sort(key=lambda item: (str(item.get("created_at") or ""), item["uri"]))
+
+        by_category: dict[str, int] = {}
+        injections = 0
+        found = 0
+        reads = 0
+        for row in rows:
+            by_category[row["category"]] = by_category.get(row["category"], 0) + row["total"]
+            injections += row["injected"]
+            found += row["found"]
+            reads += row["read"]
+
+        top = sorted(rows, key=lambda row: (-row["total"], row["uri"]))[: max(int(limit), 1)]
+        return {
+            "days": days,
+            "totals": {
+                "inventory": len(inventory),
+                "used": len(rows),
+                "unused": len(unused),
+                "deleted_but_used": sum(1 for uri in by_uri if uri not in known),
+                "injections": injections,
+                "found": found,
+                "reads": reads,
+                "accesses": injections + found + reads,
+            },
+            "by_category": by_category,
+            "top": top,
+            "unused": unused[: max(int(limit), 1)],
+        }
+
     async def audit_logs(
         self,
         *,

@@ -801,6 +801,23 @@ const workspace = {
       skills: 'Skills',
       title: 'Context Data Volume',
     },
+    memoryUsage: {
+      breakdown: '{{injected}} inj · {{found}} hit · {{read}} read',
+      description:
+        'Counts how often each self-learned memory reached an agent session: auto-injected into a context block, returned as a search hit, or read outright. Indexed resources are excluded, so the ranking reflects learned knowledge only.',
+      stats: {
+        found: 'Search hits',
+        injections: 'Auto-injections',
+        reads: 'Explicit reads',
+        unused: 'Never used / total',
+      },
+      title: 'Memory Usage',
+      topEmpty: 'No memory was used in this window',
+      topTitle: 'Most used',
+      unusedEmpty: 'Every memory was used at least once',
+      unusedTitle: 'Cleanup candidates',
+      window: 'Last {{count}} days',
+    },
     page: {
       description:
         'Aligned with the product overview: menu entries, context data volume, today tokens, today retrievals, agent access, token trend, and context commit stats.',

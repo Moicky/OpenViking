@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from openviking.observability.memory_access import publish_memory_access
 from openviking.retrieve.context_assembler.budget import (
     oversized_abstract_needs_body,
     per_entry_cap,
@@ -134,6 +135,14 @@ async def assemble_context(
     # turns without the reader ever having seen them, and hold them back from
     # the later turn they are relevant to.
     served = plan.entries if rewrite_status != "no_relevant" else []
+    # Injection accounting rides on the same definition of "served" the dedup
+    # ledger uses, so a blanked digest never inflates a memory's usage count.
+    publish_memory_access(
+        source="injected",
+        entries=served,
+        account_id=ctx.account_id,
+        user_id=getattr(getattr(ctx, "user", None), "user_id", None),
+    )
     if ledger and served:
         try:
             await ledger.record(served)

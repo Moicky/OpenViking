@@ -112,6 +112,20 @@ async def context_commits(
     return _ok_response(result)
 
 
+@router.get("/memory-usage")
+async def memory_usage(
+    request: Request,
+    days: int = Query(30, ge=0, le=365, description="Lookback window; 0 means all retained"),
+    limit: int = Query(10, ge=1, le=100, description="Rows returned per list"),
+    _ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN, Role.USER),
+):
+    """Return the most- and least-used self-learned memories."""
+    service = _runtime_service(request)
+    if service is None:
+        return _disabled_response()
+    return _ok_response(await service.memory_usage(ctx=_ctx, days=days, limit=limit))
+
+
 @router.get("/audit")
 async def audit_logs(
     request: Request,

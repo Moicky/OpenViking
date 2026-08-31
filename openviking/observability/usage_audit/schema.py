@@ -8,10 +8,10 @@ serve any region. Token and retrieval rollups are hour-grained so cross-tz
 "today" queries can slice at user-local day boundaries.
 """
 
-# Stored on the `_schema_meta` row. Version 4 has an explicit additive migration;
-# unhandled newer transitions fail closed, while older incompatible snapshots
-# continue to use the reset path.
-SCHEMA_VERSION = 5
+# Stored on the `_schema_meta` row. Versions 4 and 5 have explicit additive
+# migrations; unhandled newer transitions fail closed, while older incompatible
+# snapshots continue to use the reset path.
+SCHEMA_VERSION = 6
 
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS _schema_meta (
@@ -70,6 +70,22 @@ CREATE TABLE IF NOT EXISTS usage_context_write_bucket (
 CREATE INDEX IF NOT EXISTS idx_usage_context_write_account_date
     ON usage_context_write_bucket(account_id, date_utc, hour_utc);
 
+CREATE TABLE IF NOT EXISTS memory_access_daily (
+    account_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    date_utc TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    category TEXT NOT NULL,
+    source TEXT NOT NULL,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_access_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, user_id, date_utc, uri, source)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_access_account_date
+    ON memory_access_daily(account_id, date_utc);
+CREATE INDEX IF NOT EXISTS idx_memory_access_account_uri
+    ON memory_access_daily(account_id, uri);
+
 CREATE TABLE IF NOT EXISTS request_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT,
@@ -105,5 +121,6 @@ RESET_ON_SCHEMA_UPGRADE_TABLES = (
     "usage_token_hourly",
     "usage_retrieval_hourly",
     "usage_context_write_bucket",
+    "memory_access_daily",
     "request_audit",
 )

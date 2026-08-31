@@ -240,6 +240,7 @@ class UsageAuditConfig(BaseModel):
     flush_interval_seconds: float = Field(1.0, gt=0)
     shutdown_flush_timeout_seconds: float = Field(3.0, gt=0)
     usage_retention_days: int = Field(14, ge=0)
+    memory_retention_days: int = Field(90, ge=0)
     audit_retention_days: int = Field(7, ge=0)
     audit_retention_per_account: int = Field(1000, ge=0)
     timezone: str = "local"

@@ -10,11 +10,17 @@ import time
 from typing import Any
 
 from openviking.core.namespace import canonical_user_root
+from openviking.observability.memory_access import memory_category_for_uri
 from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.identity import RequestContext
+from openviking.storage.expr import In
 from openviking_cli.exceptions import NotFoundError
 
 logger = logging.getLogger(__name__)
+
+# The dashboard reports counts, not a full listing, so a hard ceiling keeps one
+# oversized tenant from turning a page refresh into an unbounded scan.
+_MEMORY_INVENTORY_LIMIT = 10_000
 
 
 class ContextInventoryProvider:
@@ -56,6 +62,49 @@ class ContextInventoryProvider:
             "memories": memories,
             "total": files + skills + memories,
         }
+
+    async def list_memory_records(self, ctx: RequestContext) -> list[dict[str, Any]]:
+        """Every self-learned context in the caller's scope, with its category.
+
+        Feeds the "never accessed" half of memory usage: the access store only
+        knows what *was* touched, so the memories worth cleaning up can only be
+        named by subtracting it from the full inventory.
+        """
+        vikingdb = getattr(self._service, "vikingdb_manager", None)
+        if vikingdb is None:
+            return []
+        try:
+            records = await vikingdb.query(
+                filter=In("context_type", ["memory", "skill"]),
+                limit=_MEMORY_INVENTORY_LIMIT,
+                output_fields=["uri", "context_type", "created_at", "updated_at"],
+                ctx=ctx,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Usage/Audit memory inventory query failed: %s",
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return []
+
+        seen: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for record in records:
+            uri = str(record.get("uri") or "")
+            category = memory_category_for_uri(uri)
+            if not uri or category is None or uri in seen:
+                continue
+            seen.add(uri)
+            items.append(
+                {
+                    "uri": uri,
+                    "category": category,
+                    "created_at": record.get("created_at"),
+                    "updated_at": record.get("updated_at"),
+                }
+            )
+        return items
 
     async def _stat_count(self, uri: str, *, ctx: RequestContext) -> int:
         fs_service = getattr(self._service, "fs", None)

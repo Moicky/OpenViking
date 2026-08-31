@@ -16,6 +16,7 @@ from openviking.core.namespace import (
 )
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
+from openviking.observability.memory_access import publish_memory_access
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
 from openviking.server.auth import (
@@ -100,6 +101,16 @@ class ReindexRequest(BaseModel):
 router = APIRouter(prefix="/api/v1/content", tags=["content"])
 
 
+def _record_memory_read(uri: str, ctx: RequestContext) -> None:
+    """Count an explicit read of a self-learned memory; resources are ignored."""
+    publish_memory_access(
+        source="read",
+        entries=[{"uri": uri}],
+        account_id=ctx.account_id,
+        user_id=getattr(getattr(ctx, "user", None), "user_id", None),
+    )
+
+
 def _authorize_reindex_uri(uri: str, ctx: RequestContext) -> str:
     """Allow users to reindex only their own private namespace."""
     if ctx.role != Role.USER:
@@ -143,6 +154,7 @@ async def read(
             raise mapped from e
         raise
 
+    _record_memory_read(uri, _ctx)
     return Response(status="ok", result=result)
 
 
@@ -163,6 +175,7 @@ async def abstract(
         if mapped is not None:
             raise mapped from e
         raise
+    _record_memory_read(uri, _ctx)
     return Response(status="ok", result=result)
 
 
@@ -183,6 +196,7 @@ async def overview(
         if mapped is not None:
             raise mapped from e
         raise
+    _record_memory_read(uri, _ctx)
     return Response(status="ok", result=result)
 
 

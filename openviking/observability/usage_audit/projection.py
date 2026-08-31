@@ -14,6 +14,10 @@ from openviking.observability.http_error_context import (
     sanitize_public_http_error,
     serialize_public_error_details,
 )
+from openviking.observability.memory_access import (
+    MEMORY_ACCESS_SOURCES,
+    normalize_memory_category,
+)
 
 UNKNOWN_IDENTITY = "__unknown__"
 AUDIT_EXCLUDED_ROUTES = frozenset(
@@ -40,6 +44,7 @@ class UsageAuditProjection:
     token_rows: dict[tuple, int] = field(default_factory=dict)
     retrieval_rows: dict[tuple, tuple[int, int]] = field(default_factory=dict)
     context_rows: dict[tuple, int] = field(default_factory=dict)
+    memory_rows: dict[tuple, tuple[int, str]] = field(default_factory=dict)
     audit_rows: list[tuple] = field(default_factory=list)
     touched_audit_accounts: set[str] = field(default_factory=set)
 
@@ -79,6 +84,7 @@ def project_events(
     token_rows: defaultdict[tuple, int] = defaultdict(int)
     retrieval_rows: defaultdict[tuple, tuple[int, int]] = defaultdict(lambda: (0, 0))
     context_rows: defaultdict[tuple, int] = defaultdict(int)
+    memory_rows: dict[tuple, tuple[int, str]] = {}
     audit_rows: list[tuple] = []
     touched_audit_accounts: set[str] = set()
 
@@ -136,6 +142,17 @@ def project_events(
             )
             continue
 
+        if event.event_name == "memory.access":
+            _add_memory_rows(
+                memory_rows,
+                payload,
+                account_id=account_id,
+                user_id=user_id,
+                event_date=event_date,
+                created_at=created_at,
+            )
+            continue
+
         if event.event_name == "http.request":
             _project_http_request(
                 event,
@@ -152,6 +169,7 @@ def project_events(
         token_rows=dict(token_rows),
         retrieval_rows=dict(retrieval_rows),
         context_rows=dict(context_rows),
+        memory_rows=memory_rows,
         audit_rows=audit_rows,
         touched_audit_accounts=touched_audit_accounts,
     )
@@ -205,6 +223,45 @@ def _add_token_rows(
             model_key,
         )
         rows[key] += output_count
+
+
+def _add_memory_rows(
+    rows: dict[tuple, tuple[int, str]],
+    payload: dict[str, Any],
+    *,
+    account_id: str,
+    user_id: str,
+    event_date: str,
+    created_at: str,
+) -> None:
+    """Fold one `memory.access` event into per-URI day counters.
+
+    One event carries every entry served by a single recall, so a batch never
+    grows with the number of memories the assembler chose.
+    """
+    source = str(payload.get("source") or "")
+    if source not in MEMORY_ACCESS_SOURCES:
+        return
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return
+    row_account = normalize_identity(payload.get("account_id"), unknown=True)
+    if row_account == UNKNOWN_IDENTITY:
+        row_account = account_id
+    row_user = normalize_identity(payload.get("user_id")) or user_id
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        uri = str(entry.get("uri") or "")
+        category = normalize_memory_category(entry.get("category"), uri)
+        if not uri or category is None:
+            continue
+        key = (row_account, row_user, event_date, uri, category, source)
+        previous = rows.get(key)
+        if previous is None:
+            rows[key] = (1, created_at)
+        else:
+            rows[key] = (previous[0] + 1, max(previous[1], created_at))
 
 
 def _project_http_request(

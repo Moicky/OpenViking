@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from openviking.observability.events import ObservabilityEvent
+from openviking.observability.memory_access import MEMORY_ACCESS_SOURCES
 
 from .projection import UsageAuditProjection, project_events, safe_int
 from .schema import RESET_ON_SCHEMA_UPGRADE_TABLES, SCHEMA_VERSION, SQLITE_SCHEMA
@@ -48,11 +49,16 @@ class SQLiteUsageAuditStore:
         db_path: Path,
         *,
         usage_retention_days: int = 14,
+        memory_retention_days: int = 90,
         audit_retention_days: int = 7,
         audit_retention_per_account: int = 1000,
     ) -> None:
         self._db_path = Path(db_path)
         self._usage_retention_days = int(usage_retention_days)
+        # Memory access keeps a longer window than the token/retrieval rollups:
+        # "which memories can be cleaned up" is a question about months, and a
+        # 14-day window would report every quarterly-use memory as dead weight.
+        self._memory_retention_days = int(memory_retention_days)
         self._audit_retention_days = int(audit_retention_days)
         self._audit_retention_per_account = int(audit_retention_per_account)
         self._conn: sqlite3.Connection | None = None
@@ -97,8 +103,14 @@ class SQLiteUsageAuditStore:
             )
         if current == SCHEMA_VERSION:
             return
-        if current == 4 and SCHEMA_VERSION == 5:
+        if current == 4:
             SQLiteUsageAuditStore._migrate_v4_to_v5_sync(conn)
+            current = 5
+        if current == 5:
+            # v6 only adds `memory_access_daily`, which the schema script
+            # creates with IF NOT EXISTS; existing rollups carry over intact.
+            current = 6
+        if current == SCHEMA_VERSION:
             return
         if current >= 4:
             raise RuntimeError(
@@ -145,6 +157,7 @@ class SQLiteUsageAuditStore:
             "usage_token_hourly",
             "usage_retrieval_hourly",
             "usage_context_write_bucket",
+            "memory_access_daily",
             "request_audit",
         )
         self._conn.execute("BEGIN")
@@ -178,8 +191,10 @@ class SQLiteUsageAuditStore:
             self._write_token_rows(conn, projection.token_rows, updated_at)
             self._write_retrieval_rows(conn, projection.retrieval_rows, updated_at)
             self._write_context_rows(conn, projection.context_rows, updated_at)
+            self._write_memory_rows(conn, projection.memory_rows)
             self._write_audit_rows(conn, projection.audit_rows)
             self._trim_usage_rows(conn, self._usage_max_dates(projection))
+            self._trim_memory_rows(conn, self._memory_max_dates(projection))
             self._trim_audit_rows(conn, projection.touched_audit_accounts)
             conn.execute("COMMIT")
         except Exception:
@@ -250,6 +265,24 @@ class SQLiteUsageAuditStore:
         )
 
     @staticmethod
+    def _write_memory_rows(conn, rows: dict[tuple, tuple[int, str]]) -> None:
+        conn.executemany(
+            """
+            INSERT INTO memory_access_daily (
+                account_id, user_id, date_utc, uri, category, source,
+                access_count, last_access_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (account_id, user_id, date_utc, uri, source)
+            DO UPDATE SET
+                access_count = access_count + excluded.access_count,
+                category = excluded.category,
+                last_access_at = MAX(last_access_at, excluded.last_access_at)
+            """,
+            [(*key, count, last_at) for key, (count, last_at) in rows.items() if count > 0],
+        )
+
+    @staticmethod
     def _write_audit_rows(conn, rows: list[tuple]) -> None:
         conn.executemany(
             """
@@ -309,6 +342,23 @@ class SQLiteUsageAuditStore:
                     f"DELETE FROM {table} WHERE account_id = ? AND date_utc < ?",
                     (account_id, cutoff_date),
                 )
+
+    def _trim_memory_rows(self, conn, max_dates_by_account: dict[str, str]) -> None:
+        for account_id, cutoff_date in self._cutoff_dates(
+            max_dates_by_account,
+            retention_days=self._memory_retention_days,
+        ).items():
+            conn.execute(
+                "DELETE FROM memory_access_daily WHERE account_id = ? AND date_utc < ?",
+                (account_id, cutoff_date),
+            )
+
+    @staticmethod
+    def _memory_max_dates(projection: UsageAuditProjection) -> dict[str, str]:
+        max_dates: dict[str, str] = {}
+        # memory_rows: (account, user, date_utc, uri, category, source)
+        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.memory_rows, date_index=2)
+        return max_dates
 
     @staticmethod
     def _usage_max_dates(projection: UsageAuditProjection) -> dict[str, str]:
@@ -673,6 +723,85 @@ class SQLiteUsageAuditStore:
             "session_add_message": 0,
             "session_commit": 0,
         }
+
+    async def get_memory_usage(
+        self,
+        *,
+        account_id: str,
+        user_id: str | None = None,
+        days: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Per-URI access rollup for every self-learned memory touched recently.
+
+        Returns one row per URI, unsorted and unsliced: the caller ranks it and
+        joins it against the memory inventory to find what was never touched.
+        `days <= 0` means the whole retained window.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_memory_usage_sync, account_id, user_id, int(days)
+            )
+
+    def _get_memory_usage_sync(
+        self, account_id: str, user_id: str | None, days: int
+    ) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        user_sql, user_params = self._user_scope_sql(user_id)
+        date_sql = ""
+        date_params: tuple[str, ...] = ()
+        if days > 0:
+            since = (datetime.now(UTC).date() - timedelta(days=days - 1)).isoformat()
+            date_sql = "AND date_utc >= ?"
+            date_params = (since,)
+        rows = self._conn.execute(
+            f"""
+            SELECT uri,
+                   category,
+                   source,
+                   SUM(access_count) AS access_count,
+                   COUNT(DISTINCT date_utc) AS active_days,
+                   MIN(date_utc) AS first_date,
+                   MAX(last_access_at) AS last_access_at
+            FROM memory_access_daily
+            WHERE account_id = ? {user_sql} {date_sql}
+            GROUP BY uri, category, source
+            """,
+            (account_id, *user_params, *date_params),
+        ).fetchall()
+
+        merged: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            uri = str(row["uri"])
+            item = merged.setdefault(
+                uri,
+                {
+                    "uri": uri,
+                    "category": str(row["category"]),
+                    "injected": 0,
+                    "found": 0,
+                    "read": 0,
+                    "total": 0,
+                    "active_days": 0,
+                    "first_date": str(row["first_date"] or ""),
+                    "last_access_at": str(row["last_access_at"] or ""),
+                },
+            )
+            count = safe_int(row["access_count"])
+            source = str(row["source"])
+            if source in MEMORY_ACCESS_SOURCES:
+                item[source] += count
+            item["total"] += count
+            # Distinct days are counted per source; the union is at least the
+            # larger of the two and at most their sum. The larger is the honest
+            # lower bound, and never overstates how spread out the use was.
+            item["active_days"] = max(item["active_days"], safe_int(row["active_days"]))
+            first_date = str(row["first_date"] or "")
+            if first_date and (not item["first_date"] or first_date < item["first_date"]):
+                item["first_date"] = first_date
+            last_at = str(row["last_access_at"] or "")
+            if last_at > item["last_access_at"]:
+                item["last_access_at"] = last_at
+        return list(merged.values())
 
     async def query_audit_logs(
         self,

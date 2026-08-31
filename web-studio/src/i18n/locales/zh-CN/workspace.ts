@@ -768,6 +768,23 @@ const workspace = {
       skills: '技能',
       title: '上下文数据量',
     },
+    memoryUsage: {
+      breakdown: '注入 {{injected}} · 命中 {{found}} · 读取 {{read}}',
+      description:
+        '统计每条自学习记忆进入 Agent 会话的次数：被自动注入到上下文块、作为检索结果返回、或被直接读取。已索引的资源不计入，因此排名只反映自学习知识。',
+      stats: {
+        found: '检索命中次数',
+        injections: '自动注入次数',
+        reads: '主动读取次数',
+        unused: '从未使用 / 总数',
+      },
+      title: '记忆使用情况',
+      topEmpty: '该时间窗内没有记忆被使用',
+      topTitle: '使用最多',
+      unusedEmpty: '每条记忆都至少被使用过一次',
+      unusedTitle: '可清理候选',
+      window: '最近 {{count}} 天',
+    },
     page: {
       description:
         '汇总上下文数据、今日检索、Token 用量和上下文提交等运行数据。',

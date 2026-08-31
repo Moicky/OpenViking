@@ -4,6 +4,9 @@ export type HomeT = (key: string, options?: Record<string, unknown>) => string
 
 export type {
   ConsoleContextCommitItem as ContextCommitItem,
+  ConsoleMemoryUnusedItem as MemoryUnusedItem,
+  ConsoleMemoryUsageItem as MemoryUsageItem,
+  ConsoleMemoryUsageResult as MemoryUsage,
   ConsoleContextCounts as ContextCounts,
   ConsoleDashboardSummaryResult as ConsoleDashboardSummary,
   ConsoleRetrievalCounts as RetrievalCounts,

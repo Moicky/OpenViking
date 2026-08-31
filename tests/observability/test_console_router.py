@@ -56,6 +56,7 @@ class FakeConsoleService:
         self.token_series_call = None
         self.dashboard_call = None
         self.context_commits_call = None
+        self.memory_usage_call = None
 
     async def token_series(self, **kwargs):
         self.token_series_call = kwargs
@@ -84,6 +85,10 @@ class FakeConsoleService:
             "today_tokens": {},
             "today_retrievals": {},
         }
+
+    async def memory_usage(self, **kwargs):
+        self.memory_usage_call = kwargs
+        return {"days": kwargs["days"], "totals": {}, "by_category": {}, "top": [], "unused": []}
 
     async def audit_logs(self, **kwargs):
         self.audit_call = kwargs
@@ -222,3 +227,33 @@ async def test_console_router_defaults_timezone_to_none_when_missing():
         await client.get("/api/v1/console/dashboard/summary")
 
     assert service.dashboard_call["timezone_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_console_router_exposes_memory_usage_to_regular_users():
+    service = FakeConsoleService()
+    transport = httpx.ASGITransport(
+        app=_app_with_runtime(FakeRuntime(service), request_context=_user_ctx)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/api/v1/console/memory-usage", params={"days": "7", "limit": "5"}
+        )
+        rejected = await client.get("/api/v1/console/memory-usage", params={"days": "400"})
+
+    assert response.status_code == 200
+    assert response.json()["result"]["days"] == 7
+    assert service.memory_usage_call["days"] == 7
+    assert service.memory_usage_call["limit"] == 5
+    assert service.memory_usage_call["ctx"].role == Role.USER
+    assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_console_router_memory_usage_reports_disabled_runtime():
+    transport = httpx.ASGITransport(app=_app_with_runtime(None))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/v1/console/memory-usage")
+
+    assert response.status_code == 200
+    assert response.json()["result"]["enabled"] is False
